@@ -54,44 +54,53 @@ def select_stream(plugin: Any, streams: dict[str, Any]) -> tuple[str, Any]:
 
 def load_gst() -> tuple[Any, Any]:
     """Load the GStreamer introspection bindings from the installed runtime."""
-    gst_bin = shutil.which("gst-launch-1.0")
-    if gst_bin is None and os.name == "nt":
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        gst_bin = os.path.join(
-            local_app_data or "",
-            "Programs", "gstreamer", "1.0", "msvc_x86_64", "bin", "gst-launch-1.0.exe",
-        )
+    private_runtime = os.environ.get("TWITCH_TO_NDI_PRIVATE_RUNTIME") == "1"
+    if private_runtime:
+        private_root = os.environ.get("TWITCH_TO_NDI_GSTREAMER_ROOT")
+        gst_bin = os.path.join(private_root or "", "bin", "gst-launch-1.0.exe")
+        if not private_root or not os.path.isfile(gst_bin):
+            raise RuntimeError("Private GStreamer Runtime is missing or incomplete.")
+    else:
+        gst_bin = shutil.which("gst-launch-1.0")
+        if gst_bin is None and os.name == "nt":
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            gst_bin = os.path.join(
+                local_app_data or "",
+                "Programs", "gstreamer", "1.0", "msvc_x86_64", "bin", "gst-launch-1.0.exe",
+            )
     if gst_bin and os.name == "nt":
         gst_bin_dir = os.path.dirname(gst_bin)
         os.environ["PATH"] = gst_bin_dir + os.pathsep + os.environ.get("PATH", "")
         if hasattr(os, "add_dll_directory"):
             _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(gst_bin_dir))
-        runtime_root = os.path.dirname(gst_bin_dir)
-        os.environ.setdefault("PYGI_DLL_DIRS", gst_bin_dir)
-        os.environ.setdefault("GI_TYPELIB_PATH", os.path.join(runtime_root, "lib", "girepository-1.0"))
-        runtime_plugins = os.path.join(runtime_root, "lib", "gstreamer-1.0")
-        os.environ.setdefault("GST_PLUGIN_PATH_1_0", runtime_plugins)
-        os.environ.setdefault("GST_PLUGIN_SYSTEM_PATH_1_0", runtime_plugins)
-        # The official gstreamer-python wheel keeps its GI modules and typelibs
-        # namespaced under gstreamer_python so it can coexist with other packages.
+        if not private_runtime:
+            runtime_root = os.path.dirname(gst_bin_dir)
+            os.environ.setdefault("PYGI_DLL_DIRS", gst_bin_dir)
+            os.environ.setdefault("GI_TYPELIB_PATH", os.path.join(runtime_root, "lib", "girepository-1.0"))
+            runtime_plugins = os.path.join(runtime_root, "lib", "gstreamer-1.0")
+            os.environ.setdefault("GST_PLUGIN_PATH_1_0", runtime_plugins)
+            os.environ.setdefault("GST_PLUGIN_SYSTEM_PATH_1_0", runtime_plugins)
+        # The official gstreamer-python wheel keeps its Python GI modules
+        # namespaced. In private mode, its plugin and typelib paths stay excluded.
         try:
             gst_python = importlib.import_module("gstreamer_python")
             binding_paths = gst_python.environment["PYTHONPATH"].split(os.pathsep)
             for path in reversed(binding_paths):
                 if path not in sys.path:
                     sys.path.insert(0, path)
-            binding_root = os.path.join(os.path.dirname(gst_python.__file__), "Lib")
-            binding_typelibs = os.path.join(binding_root, "girepository-1.0")
-            os.environ["GI_TYPELIB_PATH"] = os.pathsep.join(
-                [binding_typelibs, os.environ["GI_TYPELIB_PATH"]]
-            )
-            binding_plugins = os.path.join(binding_root, "gstreamer-1.0")
-            os.environ["GST_PLUGIN_PATH_1_0"] = os.pathsep.join(
-                [binding_plugins, os.environ["GST_PLUGIN_PATH_1_0"]]
-            )
-            os.environ["GST_PLUGIN_SYSTEM_PATH_1_0"] = os.pathsep.join(
-                [runtime_plugins, binding_plugins]
-            )
+            if not private_runtime:
+                binding_root = os.path.join(os.path.dirname(gst_python.__file__), "Lib")
+                binding_typelibs = os.path.join(binding_root, "girepository-1.0")
+                os.environ["GI_TYPELIB_PATH"] = os.pathsep.join(
+                    [binding_typelibs, os.environ["GI_TYPELIB_PATH"]]
+                )
+                binding_plugins = os.path.join(binding_root, "gstreamer-1.0")
+                os.environ["GST_PLUGIN_PATH_1_0"] = os.pathsep.join(
+                    [binding_plugins, os.environ["GST_PLUGIN_PATH_1_0"]]
+                )
+                os.environ["GST_PLUGIN_SYSTEM_PATH_1_0"] = os.pathsep.join(
+                    [runtime_plugins, binding_plugins]
+                )
         except ImportError:
             pass
     try:

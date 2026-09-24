@@ -5,7 +5,7 @@ Minimal Twitch live stream to NDI relay for Windows.
 ## Requirements
 
 - Python 3.14 or newer, managed with `uv`
-- GStreamer 1.28.6 MSVC x86_64 installed at the existing GStreamer path
+- GStreamer 1.28.6 MSVC x86_64 Full Runtime in `runtime/gstreamer` (or at the existing GStreamer path for the conventional launcher)
 - Matching `gstreamer-python` bindings (declared in the script metadata)
 - GStreamer elements: `parsebin`, `d3d11h264dec`, `d3d11download`, `mfaacdec`, `ndisinkcombiner`, and `ndisink`
 - NDI Runtime installed
@@ -16,6 +16,42 @@ Install the locked dependencies and launch the Tkinter interface:
 uv sync
 uv run twitch-to-ndi
 ```
+
+## Private Runtime investigation
+
+The official GStreamer 1.28.6 Full Runtime baseline is kept in the ignored
+`runtime-source/gstreamer-full` directory. Build the allowlisted private
+runtime from its dependency manifest with:
+
+```powershell
+uv run python scripts/prepare_gstreamer_runtime.py
+```
+
+Use `--full` only to copy the full baseline instead of the minimal runtime.
+
+The private launch and element inspection configure an explicit plugin path,
+an empty system plugin path, a private plugin scanner, registry cache, and
+typelib directory before loading the Python bindings:
+
+```powershell
+uv run python scripts/inspect_gstreamer.py
+uv run python scripts/run_private.py
+```
+
+The launch checks that required GStreamer modules resolve inside
+`runtime/gstreamer`. For local testing it uses the installed NDI runtime
+selected by `NDI_RUNTIME_DIR_V6`; otherwise it can use `runtime/ndi`. It never
+falls back to a system GStreamer installation. Check both runtimes without
+opening the UI with:
+
+```powershell
+uv run python scripts/run_private.py --check-only
+```
+
+For future redistribution, follow the [NDI SDK software distribution
+guide](https://docs.ndi.video/all/developing-with-ndi/sdk/software-distribution)
+and [licensing guide](https://docs.ndi.video/all/developing-with-ndi/sdk/licensing),
+including the required NDI attribution and license coverage.
 
 The previous command-line interface remains available:
 

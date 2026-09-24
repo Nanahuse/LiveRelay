@@ -1,0 +1,64 @@
+{
+  "gstreamer_version": "1.28.6",
+  "source_directory": "runtime-source/gstreamer-full",
+  "plugins": [
+    "coreelements",
+    "app",
+    "playback",
+    "typefindfunctions",
+    "mpegtsdemux",
+    "isomp4",
+    "videoparsersbad",
+    "audioparsers",
+    "d3d11",
+    "mediafoundation",
+    "audioconvert",
+    "audioresample",
+    "ndi"
+  ],
+  "elements": {
+    "appsrc": "app",
+    "parsebin": "playback",
+    "typefind": "coreelements",
+    "queue": "coreelements",
+    "valve": "coreelements",
+    "clocksync": "coreelements",
+    "tsdemux": "mpegtsdemux",
+    "qtdemux": "isomp4",
+    "h264parse": "videoparsersbad",
+    "aacparse": "audioparsers",
+    "d3d11h264dec": "d3d11",
+    "d3d11download": "d3d11",
+    "mfaacdec": "mediafoundation",
+    "audioconvert": "audioconvert",
+    "audioresample": "audioresample",
+    "ndisinkcombiner": "ndi",
+    "ndisink": "ndi"
+  },
+  "tools": [
+    "gst-inspect-1.0.exe",
+    "gst-launch-1.0.exe"
+  ],
+  "typelibs": [
+    "GIRepository-2.0.typelib",
+    "Gio-2.0.typelib",
+    "GLib-2.0.typelib",
+    "GModule-2.0.typelib",
+    "GObject-2.0.typelib",
+    "Gst-1.0.typelib",
+    "GstApp-1.0.typelib",
+    "GstAudio-1.0.typelib",
+    "GstBase-1.0.typelib",
+    "GstVideo-1.0.typelib"
+  ],
+  "runtime_files": [
+    {
+      "source": "bin/girepository-1.0-1.dll",
+      "destination": "bin/girepository-1.0-1.dll"
+    }
+  ],
+  "notes": {
+    "ndi_runtime": "Local verification uses NDI_RUNTIME_DIR_V6 when available, otherwise runtime/ndi. For redistribution, follow official NDI SDK terms, attribution, and third-party notice requirements.",
+    "containers": ["MPEG-TS", "fragmented MP4 / ISO BMFF"]
+  }
+}

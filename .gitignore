@@ -203,6 +203,13 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Private runtime inputs and generated outputs (not committed)
+runtime-source/downloads/
+runtime-source/gstreamer-full/
+runtime/gstreamer/
+runtime/ndi/
+cache/*.bin
+
 # Ruff stuff:
 .ruff_cache/
 
