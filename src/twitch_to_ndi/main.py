@@ -24,7 +24,7 @@ from streamlink.exceptions import StreamlinkError
 
 
 MAX_DELAY_MS = 30_000
-INITIAL_DELAY_MS = 5_000
+INITIAL_DELAY_MS = 0
 QUEUE_MAX_TIME_NS = 35_000_000_000
 QUEUE_MAX_BYTES = 0
 QUEUE_MAX_BUFFERS = 0
@@ -34,6 +34,8 @@ QUEUE_LOG_INTERVAL_MS = 1_000
 QUEUE_STALL_WARNING_SECONDS = 10
 CHUNK_SIZE = 64 * 1024
 APP_SOURCE_MAX_BYTES = 1024 * 1024
+DIAGNOSTIC_INTERVAL_SECONDS = 0.25
+DIAGNOSTICS_ENABLED = os.environ.get("TWITCH_TO_NDI_DIAGNOSTICS") == "1"
 _DLL_DIRECTORY_HANDLES: list[Any] = []
 
 
@@ -104,7 +106,12 @@ def load_gst() -> tuple[Any, Any]:
         ) from error
 
 
-def build_pipeline(Gst: Any, ndi_name: str) -> tuple[Any, dict[str, Any]]:
+def build_pipeline(
+    Gst: Any,
+    ndi_name: str,
+    initial_delay_ms: int = INITIAL_DELAY_MS,
+    on_media_info: Any = None,
+) -> tuple[Any, dict[str, Any]]:
     pipeline = Gst.Pipeline.new("twitch-to-ndi")
     if pipeline is None:
         raise RuntimeError("Could not create GStreamer pipeline")
@@ -152,7 +159,7 @@ def build_pipeline(Gst: Any, ndi_name: str) -> tuple[Any, dict[str, Any]]:
     appsrc.set_property("max-bytes", APP_SOURCE_MAX_BYTES)
     appsrc.set_property("stream-type", 0)  # GST_APP_STREAM_TYPE_STREAM
     sink.set_property("ndi-name", ndi_name)
-    sync.set_property("ts-offset", INITIAL_DELAY_MS * 1_000_000)
+    sync.set_property("ts-offset", initial_delay_ms * 1_000_000)
     valve.set_property("drop", False)
 
     for element in elements.values():
@@ -192,6 +199,25 @@ def build_pipeline(Gst: Any, ndi_name: str) -> tuple[Any, dict[str, Any]]:
         raise RuntimeError("Could not link audio to NDI combiner request pad")
 
     linked_pads: set[int] = set()
+    reported_media: set[str] = set()
+
+    def report_caps(media: str, caps: Any) -> None:
+        if on_media_info is None or media in reported_media or caps is None or caps.get_size() == 0:
+            return
+        structure = caps.get_structure(0)
+        info: dict[str, Any] = {"media": media}
+        if media == "video":
+            info["width"] = structure.get_value("width")
+            info["height"] = structure.get_value("height")
+            fps = structure.get_value("framerate")
+            try:
+                info["fps"] = float(fps.num) / float(fps.denom)
+            except (AttributeError, TypeError, ZeroDivisionError):
+                info["fps"] = None
+        elif media == "audio":
+            info["audio_rate"] = structure.get_value("rate")
+        on_media_info(info)
+        reported_media.add(media)
 
     def on_demux_pad(_element: Any, pad: Any) -> None:
         caps = pad.get_current_caps() or pad.query_caps(None)
@@ -214,6 +240,15 @@ def build_pipeline(Gst: Any, ndi_name: str) -> tuple[Any, dict[str, Any]]:
             print(f"Could not link parsed {media_type} stream: {result.value_nick}", file=sys.stderr, flush=True)
 
     parser.connect("pad-added", on_demux_pad)
+    if on_media_info is not None:
+        for media, caps_element in (("video", video_caps), ("audio", audio_caps)):
+            src_pad = caps_element.get_static_pad("src")
+
+            def report_negotiated_caps(pad: Any, _info: Any, selected_media: str = media) -> Any:
+                report_caps(selected_media, pad.get_current_caps())
+                return Gst.PadProbeReturn.OK
+
+            src_pad.add_probe(Gst.PadProbeType.BUFFER, report_negotiated_caps)
     elements["ndi_audio_caps"] = audio_caps
     return pipeline, elements
 
@@ -233,10 +268,10 @@ class Adjustment:
 
 
 class DelayController:
-    def __init__(self, GLib: Any, elements: dict[str, Any]) -> None:
+    def __init__(self, GLib: Any, elements: dict[str, Any], initial_delay_ms: int = INITIAL_DELAY_MS) -> None:
         self.GLib = GLib
         self.elements = elements
-        self.delay_ms = INITIAL_DELAY_MS
+        self.delay_ms = initial_delay_ms
         self.adjustment: Adjustment | None = None
         self._lock = threading.RLock()
 
@@ -308,8 +343,15 @@ class DelayController:
             audio_reduction = adjustment.audio_start_ns - audio_now
             elapsed = time.monotonic() - adjustment.started_at
             report_progress = elapsed - adjustment.last_report_at >= QUEUE_LOG_INTERVAL_MS / 1_000
-            enough = reduction_ns - QUEUE_TOLERANCE_NS
-            if video_reduction >= enough and audio_reduction >= enough:
+            video_enough = max(
+                0, min(reduction_ns, adjustment.video_start_ns) - QUEUE_TOLERANCE_NS
+            )
+            audio_enough = max(
+                0, min(reduction_ns, adjustment.audio_start_ns) - QUEUE_TOLERANCE_NS
+            )
+            video_done = video_enough == 0 or video_reduction >= video_enough
+            audio_done = audio_enough == 0 or audio_reduction >= audio_enough
+            if video_done and audio_done:
                 self.elements["output_valve"].set_property("drop", False)
                 self.adjustment = None
                 print("Delay adjustment complete", flush=True)
@@ -348,7 +390,15 @@ class DelayController:
 
 
 class Runtime:
-    def __init__(self, Gst: Any, GLib: Any, pipeline: Any, elements: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        Gst: Any,
+        GLib: Any,
+        pipeline: Any,
+        elements: dict[str, Any],
+        initial_delay_ms: int = INITIAL_DELAY_MS,
+        notify: Any = None,
+    ) -> None:
         self.Gst = Gst
         self.GLib = GLib
         self.pipeline = pipeline
@@ -356,19 +406,57 @@ class Runtime:
         self.loop = GLib.MainLoop()
         self.commands: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.failed: BaseException | None = None
-        self.controller = DelayController(GLib, elements)
+        self.controller = DelayController(GLib, elements, initial_delay_ms)
+        self.notify = notify
+        self._diagnostic_started_at = time.monotonic()
+        self._last_diagnostic_at = 0.0
         bus = pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
         GLib.timeout_add(25, self._drain_commands)
+        if self.notify is not None or DIAGNOSTICS_ENABLED:
+            GLib.timeout_add(200, self._publish_snapshot)
 
     def _on_bus_message(self, _bus: Any, message: Any) -> None:
         if message.type == self.Gst.MessageType.ERROR:
             error, debug = message.parse_error()
             self.failed = RuntimeError(f"GStreamer error: {error}; {debug or ''}")
+            if self.notify is not None:
+                self.notify("error", str(error))
             self.loop.quit()
         elif message.type == self.Gst.MessageType.EOS:
             self.loop.quit()
+        elif message.type == self.Gst.MessageType.STATE_CHANGED and message.src == self.pipeline:
+            _old, new, _pending = message.parse_state_changed()
+            if new == self.Gst.State.PLAYING and self.notify is not None:
+                self.notify("running", None)
+
+    def _publish_snapshot(self) -> bool:
+        try:
+            now = time.monotonic()
+            snapshot = {
+                "delay_ms": self.controller.delay_ms,
+                "adjusting_delay": self.controller.adjustment is not None,
+                "appsrc_buffer_bytes": int(self.elements["appsrc"].get_property("current-level-bytes")),
+                "video_buffer_ms": int(self.elements["video_delay_queue"].get_property("current-level-time")) // 1_000_000,
+                "audio_buffer_ms": int(self.elements["audio_delay_queue"].get_property("current-level-time")) // 1_000_000,
+            }
+            if DIAGNOSTICS_ENABLED and now - self._last_diagnostic_at >= DIAGNOSTIC_INTERVAL_SECONDS:
+                self._last_diagnostic_at = now
+                print(
+                    f"DIAG pipeline t={now - self._diagnostic_started_at:.3f}s "
+                    f"appsrc_bytes={snapshot['appsrc_buffer_bytes']} "
+                    f"video_queue_ms={snapshot['video_buffer_ms']} "
+                    f"audio_queue_ms={snapshot['audio_buffer_ms']} "
+                    f"delay_ms={snapshot['delay_ms']} "
+                    f"adjusting={snapshot['adjusting_delay']}",
+                    flush=True,
+                )
+            if self.notify is not None:
+                self.notify("runtime_snapshot", snapshot)
+        except Exception as error:
+            print(f"Could not read GStreamer status: {error}", file=sys.stderr, flush=True)
+        return True
 
     def _drain_commands(self) -> bool:
         while True:
@@ -390,12 +478,51 @@ class Runtime:
 
 
 def pump_stream(stream_io: Any, appsrc: Any, Gst: Any, stop: threading.Event, errors: queue.Queue[BaseException]) -> None:
+    started_at = time.monotonic()
+    last_read_at = started_at
+    total_bytes = 0
+    read_count = 0
+    window_started_at = started_at
+    window_read_count = 0
+    window_bytes = 0
+    window_max_read_ms = 0.0
+    window_max_gap_ms = 0.0
     try:
         while not stop.is_set():
+            read_started_at = time.monotonic()
             chunk = stream_io.read(CHUNK_SIZE)
+            read_completed_at = time.monotonic()
             if not chunk:
+                print("DIAG stream-eof", flush=True)
                 appsrc.emit("end-of-stream")
                 return
+            read_ms = (read_completed_at - read_started_at) * 1000
+            gap_ms = (read_completed_at - last_read_at) * 1000
+            last_read_at = read_completed_at
+            total_bytes += len(chunk)
+            read_count += 1
+            window_read_count += 1
+            window_bytes += len(chunk)
+            window_max_read_ms = max(window_max_read_ms, read_ms)
+            window_max_gap_ms = max(window_max_gap_ms, gap_ms)
+            if DIAGNOSTICS_ENABLED and read_completed_at - window_started_at >= 1.0:
+                print(
+                    f"DIAG stream-window t={read_completed_at - started_at:.3f}s "
+                    f"reads={window_read_count} bytes={window_bytes} "
+                    f"max_read_ms={window_max_read_ms:.1f} max_gap_ms={window_max_gap_ms:.1f}",
+                    flush=True,
+                )
+                window_started_at = read_completed_at
+                window_read_count = 0
+                window_bytes = 0
+                window_max_read_ms = 0.0
+                window_max_gap_ms = 0.0
+            elif not DIAGNOSTICS_ENABLED and gap_ms >= 1000:
+                print(
+                    f"DIAG stream-stall t={read_completed_at - started_at:.3f}s "
+                    f"read_ms={read_ms:.1f} gap_ms={gap_ms:.1f} chunk_bytes={len(chunk)}",
+                    flush=True,
+                )
             buffer = Gst.Buffer.new_allocate(None, len(chunk), None)
             buffer.fill(0, chunk)
             result = appsrc.emit("push-buffer", buffer)
@@ -403,6 +530,7 @@ def pump_stream(stream_io: Any, appsrc: Any, Gst: Any, stop: threading.Event, er
                 if not stop.is_set() and result != Gst.FlowReturn.FLUSHING:
                     errors.put(RuntimeError(f"GStreamer appsrc rejected data: {result.value_nick}"))
                 return
+        print(f"DIAG stream-stopped reads={read_count} total_bytes={total_bytes}", flush=True)
     except BaseException as error:
         if not stop.is_set():
             errors.put(error)
@@ -446,7 +574,7 @@ def run(url: str, ndi_name: str) -> int:
         Gst.init(None)
         session = Streamlink()
         _, plugin_class, resolved_url = session.resolve_url(url)
-        plugin = plugin_class(session, resolved_url)
+        plugin = plugin_class(session, resolved_url, options={"low-latency": True})
         streams = plugin.streams()
         if not streams:
             raise ValueError("Twitch returned no streams (the channel may be offline)")

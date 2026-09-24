@@ -14,7 +14,8 @@ dependencies = [
 ]
 
 [project.scripts]
-twitch-to-ndi = "twitch_to_ndi.main:main"
+twitch-to-ndi = "twitch_to_ndi.ui:main"
+twitch-to-ndi-cli = "twitch_to_ndi.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

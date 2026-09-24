@@ -10,30 +10,27 @@ Minimal Twitch live stream to NDI relay for Windows.
 - GStreamer elements: `parsebin`, `d3d11h264dec`, `d3d11download`, `mfaacdec`, `ndisinkcombiner`, and `ndisink`
 - NDI Runtime installed
 
-Run directly with the dependencies declared in `main.py`'s PEP 723 metadata:
-
-```powershell
-uv run .\src\twitch_to_ndi\main.py https://www.twitch.tv/example --ndi-name "Runner A"
-```
-
-uv creates an isolated environment from the script's inline dependency list. To install the package and use its console command instead:
+Install the locked dependencies and launch the Tkinter interface:
 
 ```powershell
 uv sync
-twitch-to-ndi https://www.twitch.tv/example --ndi-name "Runner A"
+uv run twitch-to-ndi
 ```
 
-The relay lists available Twitch qualities and selects the lowest Twitch pixel-weight quality at 480p or higher. It defaults to a 5-second delay and accepts these commands while running:
+The previous command-line interface remains available:
 
-```text
-delay 5000
-delay 7000
-delay 3000
-status
-quit
+```powershell
+twitch-to-ndi-cli https://www.twitch.tv/example --ndi-name "Runner A"
 ```
 
-Delay is limited to 0–30 seconds. Reducing delay drops the combined NDI output while the compressed queues drain; H.264/AAC buffers continue through their decoders. Queue levels are printed by `status` and while a decrease is in progress. Press Ctrl+C or enter `quit` to stop.
+The GUI selects the lowest Twitch pixel-weight quality at 480p or higher and requests Streamlink's Twitch low-latency mode. Twitch broadcasters must enable low-latency streaming for their channels; regular streams may buffer with this option. The GUI starts with a 0-second delay, supports 0–30 seconds in 0.1-second steps or larger buttons, and stops the stream when the window closes. Reducing delay drops the combined NDI output while the compressed queues drain; H.264/AAC buffers continue through their decoders.
+
+For detailed Streamlink read and GStreamer queue timing in the terminal, enable diagnostics before launch:
+
+```powershell
+$env:TWITCH_TO_NDI_DIAGNOSTICS = "1"
+uv run twitch-to-ndi
+```
 
 Check the GStreamer prerequisites with:
 
