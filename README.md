@@ -62,7 +62,7 @@ it is not copied from the build machine into the bundle.
 
 ```powershell
 uv sync --group build
-uv run --group build pyinstaller --clean --noconfirm packaging/twitch_to_ndi.spec
+uv run --group build python packaging/build.py
 ```
 
 The onedir output is `dist/TwitchToNDI/TwitchToNDI.exe`, with
