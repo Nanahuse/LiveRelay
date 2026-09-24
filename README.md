@@ -53,6 +53,30 @@ guide](https://docs.ndi.video/all/developing-with-ndi/sdk/software-distribution)
 and [licensing guide](https://docs.ndi.video/all/developing-with-ndi/sdk/licensing),
 including the required NDI attribution and license coverage.
 
+## Build the Windows onedir application
+
+Build on Windows with Python 3.14. The private GStreamer runtime and the
+`gstreamer-python` wheel must be available in the checkout. The installed NDI
+Runtime is resolved through `NDI_RUNTIME_DIR_V6` when the application starts;
+it is not copied from the build machine into the bundle.
+
+```powershell
+uv sync --group build
+uv run --group build pyinstaller --clean --noconfirm packaging/twitch_to_ndi.spec
+```
+
+The onedir output is `dist/TwitchToNDI/TwitchToNDI.exe`, with
+`runtime/gstreamer` beside the executable. Run the bundled dependency check
+with:
+
+```powershell
+.\dist\TwitchToNDI\TwitchToNDI.exe --check-only
+```
+
+The windowed executable writes diagnostics to
+`%LOCALAPPDATA%\LiveRelay\logs\twitch-to-ndi.log` and stores its private
+GStreamer registry under `%LOCALAPPDATA%\LiveRelay\cache`.
+
 The previous command-line interface remains available:
 
 ```powershell

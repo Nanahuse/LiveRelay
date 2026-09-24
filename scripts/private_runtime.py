@@ -10,6 +10,8 @@ _GST_PATH_MARKERS = ("gstreamer", "gst-plugin")
 
 
 def workspace_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1]
 
 
@@ -33,7 +35,12 @@ def configure_private_environment(root: Path | None = None) -> tuple[Path, Path]
     plugins = gst_root / "lib" / "gstreamer-1.0"
     scanner = gst_root / "libexec" / "gstreamer-1.0" / "gst-plugin-scanner.exe"
     typelibs = gst_root / "lib" / "girepository-1.0"
-    registry = root / "cache" / "gstreamer-registry.bin"
+    if getattr(sys, "frozen", False):
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        cache_root = local_app_data / "LiveRelay" / "cache"
+    else:
+        cache_root = root / "cache"
+    registry = cache_root / "gstreamer-registry.bin"
 
     required = (gst_bin, plugins, scanner, typelibs)
     missing = [str(path) for path in required if not path.exists()]
@@ -73,15 +80,22 @@ def configure_private_environment(root: Path | None = None) -> tuple[Path, Path]
     os.environ["GST_REGISTRY"] = str(registry)
     os.environ["GI_TYPELIB_PATH"] = str(typelibs)
 
-    # Resolve the binding wheel only after the private DLL and typelib paths
-    # are fixed. Keep its Python modules without inheriting its GStreamer tree.
-    if "gstreamer_python" not in sys.modules:
-        import gstreamer_python
+    if getattr(sys, "frozen", False):
+        binding_site_packages = root / "gstreamer-python"
+        if not (binding_site_packages / "gi" / "__init__.py").is_file():
+            raise FileNotFoundError(f"Bundled PyGObject modules are missing: {binding_site_packages}")
+        if str(binding_site_packages) not in sys.path:
+            sys.path.insert(0, str(binding_site_packages))
+    else:
+        # Resolve the binding wheel only after the private DLL and typelib
+        # paths are fixed. Keep its Python modules without inheriting its GStreamer tree.
+        if "gstreamer_python" not in sys.modules:
+            import gstreamer_python
 
-    binding_paths = sys.modules["gstreamer_python"].environment["PYTHONPATH"].split(os.pathsep)
-    for path in binding_paths:
-        if path and path not in sys.path:
-            sys.path.insert(0, path)
+        binding_paths = sys.modules["gstreamer_python"].environment["PYTHONPATH"].split(os.pathsep)
+        for path in binding_paths:
+            if path and path not in sys.path:
+                sys.path.insert(0, path)
 
     return gst_root, ndi_root
 

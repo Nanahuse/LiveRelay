@@ -42,6 +42,13 @@ def main() -> int:
     args = parser.parse_args()
 
     root = workspace_root()
+    if getattr(sys, "frozen", False):
+        log_directory = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "LiveRelay" / "logs"
+        log_directory.mkdir(parents=True, exist_ok=True)
+        log_file = (log_directory / "twitch-to-ndi.log").open("a", encoding="utf-8", buffering=1)
+        sys.stdout = log_file
+        sys.stderr = log_file
+
     sys.path.insert(0, str(root / "src"))
     gst_root, ndi_root = configure_private_environment(root)
 

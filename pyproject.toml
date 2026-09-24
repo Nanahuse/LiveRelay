@@ -17,5 +17,10 @@ dependencies = [
 twitch-to-ndi = "twitch_to_ndi.ui:main"
 twitch-to-ndi-cli = "twitch_to_ndi.main:main"
 
+[dependency-groups]
+build = [
+    "pyinstaller==6.22.3",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]

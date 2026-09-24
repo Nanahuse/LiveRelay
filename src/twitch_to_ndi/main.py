@@ -80,29 +80,31 @@ def load_gst() -> tuple[Any, Any]:
             runtime_plugins = os.path.join(runtime_root, "lib", "gstreamer-1.0")
             os.environ.setdefault("GST_PLUGIN_PATH_1_0", runtime_plugins)
             os.environ.setdefault("GST_PLUGIN_SYSTEM_PATH_1_0", runtime_plugins)
-        # The official gstreamer-python wheel keeps its Python GI modules
-        # namespaced. In private mode, its plugin and typelib paths stay excluded.
-        try:
-            gst_python = importlib.import_module("gstreamer_python")
-            binding_paths = gst_python.environment["PYTHONPATH"].split(os.pathsep)
-            for path in reversed(binding_paths):
-                if path not in sys.path:
-                    sys.path.insert(0, path)
-            if not private_runtime:
-                binding_root = os.path.join(os.path.dirname(gst_python.__file__), "Lib")
-                binding_typelibs = os.path.join(binding_root, "girepository-1.0")
-                os.environ["GI_TYPELIB_PATH"] = os.pathsep.join(
-                    [binding_typelibs, os.environ["GI_TYPELIB_PATH"]]
-                )
-                binding_plugins = os.path.join(binding_root, "gstreamer-1.0")
-                os.environ["GST_PLUGIN_PATH_1_0"] = os.pathsep.join(
-                    [binding_plugins, os.environ["GST_PLUGIN_PATH_1_0"]]
-                )
-                os.environ["GST_PLUGIN_SYSTEM_PATH_1_0"] = os.pathsep.join(
-                    [runtime_plugins, binding_plugins]
-                )
-        except ImportError:
-            pass
+        # Frozen builds get the namespaced GI modules from the onedir bundle.
+        # Source runs use the official wheel's Python path while keeping its
+        # GStreamer plugins and typelibs excluded in private mode.
+        if not (private_runtime and getattr(sys, "frozen", False)):
+            try:
+                gst_python = importlib.import_module("gstreamer_python")
+                binding_paths = gst_python.environment["PYTHONPATH"].split(os.pathsep)
+                for path in reversed(binding_paths):
+                    if path not in sys.path:
+                        sys.path.insert(0, path)
+                if not private_runtime:
+                    binding_root = os.path.join(os.path.dirname(gst_python.__file__), "Lib")
+                    binding_typelibs = os.path.join(binding_root, "girepository-1.0")
+                    os.environ["GI_TYPELIB_PATH"] = os.pathsep.join(
+                        [binding_typelibs, os.environ["GI_TYPELIB_PATH"]]
+                    )
+                    binding_plugins = os.path.join(binding_root, "gstreamer-1.0")
+                    os.environ["GST_PLUGIN_PATH_1_0"] = os.pathsep.join(
+                        [binding_plugins, os.environ["GST_PLUGIN_PATH_1_0"]]
+                    )
+                    os.environ["GST_PLUGIN_SYSTEM_PATH_1_0"] = os.pathsep.join(
+                        [runtime_plugins, binding_plugins]
+                    )
+            except ImportError:
+                pass
     try:
         gi = importlib.import_module("gi")
         gi.require_version("Gst", "1.0")
