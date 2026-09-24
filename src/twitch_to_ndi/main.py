@@ -2,22 +2,39 @@
 # requires-python = ">=3.14"
 # dependencies = [
 #     "streamlink>=7.0",
+#     "PyGObject>=3.50; sys_platform != 'win32'",
+#     "gstreamer-python==1.28.6; sys_platform == 'win32'",
 # ]
 # ///
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
+import queue
 import shutil
-import subprocess
 import sys
+import threading
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from streamlink import Streamlink
 from streamlink.exceptions import StreamlinkError
 
 
+MAX_DELAY_MS = 30_000
+INITIAL_DELAY_MS = 5_000
+QUEUE_MAX_TIME_NS = 35_000_000_000
+QUEUE_MAX_BYTES = 0
+QUEUE_MAX_BUFFERS = 0
+QUEUE_TOLERANCE_NS = 10_000_000
+QUEUE_POLL_INTERVAL_MS = 50
+QUEUE_LOG_INTERVAL_MS = 1_000
+QUEUE_STALL_WARNING_SECONDS = 10
 CHUNK_SIZE = 64 * 1024
+APP_SOURCE_MAX_BYTES = 1024 * 1024
+_DLL_DIRECTORY_HANDLES: list[Any] = []
 
 
 def select_stream(plugin: Any, streams: dict[str, Any]) -> tuple[str, Any]:
@@ -33,99 +50,467 @@ def select_stream(plugin: Any, streams: dict[str, Any]) -> tuple[str, Any]:
     return name, stream
 
 
-def make_pipeline(ndi_name: str) -> list[str]:
-    gst_launch = shutil.which("gst-launch-1.0")
-    if gst_launch is None and os.name == "nt":
-        gst_root = os.environ.get("GSTREAMER_1_0_ROOT_MSVC_X86_64")
-        candidates = []
-        if gst_root:
-            candidates.append(os.path.join(gst_root, "bin", "gst-launch-1.0.exe"))
+def load_gst() -> tuple[Any, Any]:
+    """Load the GStreamer introspection bindings from the installed runtime."""
+    gst_bin = shutil.which("gst-launch-1.0")
+    if gst_bin is None and os.name == "nt":
         local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            candidates.append(os.path.join(
-                local_app_data, "Programs", "gstreamer", "1.0", "msvc_x86_64", "bin", "gst-launch-1.0.exe"
-            ))
-        gst_launch = next((path for path in candidates if os.path.isfile(path)), None)
-    if gst_launch is None:
-        raise FileNotFoundError("gst-launch-1.0 was not found on PATH")
-    return [
-        gst_launch, "-e", "fdsrc", "fd=0", "is-live=true", "!",
-        "parsebin", "name=p",
-        "ndisinkcombiner", "name=comb", "!", "ndisink", f"ndi-name={ndi_name}",
-        "p.", "!", "queue", "!", "video/x-h264", "!", "d3d11h264dec", "!",
-        "d3d11download", "!",
-        "video/x-raw,format=NV12", "!", "comb.video",
-        "p.", "!", "queue", "!", "audio/mpeg,mpegversion=4", "!", "mfaacdec", "!",
-        "audioconvert", "!", "audioresample", "!",
-        "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2", "!", "queue", "!", "comb.audio",
-    ]
+        gst_bin = os.path.join(
+            local_app_data or "",
+            "Programs", "gstreamer", "1.0", "msvc_x86_64", "bin", "gst-launch-1.0.exe",
+        )
+    if gst_bin and os.name == "nt":
+        gst_bin_dir = os.path.dirname(gst_bin)
+        os.environ["PATH"] = gst_bin_dir + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(gst_bin_dir))
+        runtime_root = os.path.dirname(gst_bin_dir)
+        os.environ.setdefault("PYGI_DLL_DIRS", gst_bin_dir)
+        os.environ.setdefault("GI_TYPELIB_PATH", os.path.join(runtime_root, "lib", "girepository-1.0"))
+        runtime_plugins = os.path.join(runtime_root, "lib", "gstreamer-1.0")
+        os.environ.setdefault("GST_PLUGIN_PATH_1_0", runtime_plugins)
+        os.environ.setdefault("GST_PLUGIN_SYSTEM_PATH_1_0", runtime_plugins)
+        # The official gstreamer-python wheel keeps its GI modules and typelibs
+        # namespaced under gstreamer_python so it can coexist with other packages.
+        try:
+            gst_python = importlib.import_module("gstreamer_python")
+            binding_paths = gst_python.environment["PYTHONPATH"].split(os.pathsep)
+            for path in reversed(binding_paths):
+                if path not in sys.path:
+                    sys.path.insert(0, path)
+            binding_root = os.path.join(os.path.dirname(gst_python.__file__), "Lib")
+            binding_typelibs = os.path.join(binding_root, "girepository-1.0")
+            os.environ["GI_TYPELIB_PATH"] = os.pathsep.join(
+                [binding_typelibs, os.environ["GI_TYPELIB_PATH"]]
+            )
+            binding_plugins = os.path.join(binding_root, "gstreamer-1.0")
+            os.environ["GST_PLUGIN_PATH_1_0"] = os.pathsep.join(
+                [binding_plugins, os.environ["GST_PLUGIN_PATH_1_0"]]
+            )
+            os.environ["GST_PLUGIN_SYSTEM_PATH_1_0"] = os.pathsep.join(
+                [runtime_plugins, binding_plugins]
+            )
+        except ImportError:
+            pass
+    try:
+        gi = importlib.import_module("gi")
+        gi.require_version("Gst", "1.0")
+        gi.require_version("GLib", "2.0")
+        return importlib.import_module("gi.repository.Gst"), importlib.import_module("gi.repository.GLib")
+    except (ImportError, ValueError) as error:
+        raise RuntimeError(
+            "GStreamer Python introspection bindings (PyGObject/Gst typelib) are not available. "
+            "Install bindings compatible with the installed GStreamer runtime."
+        ) from error
+
+
+def build_pipeline(Gst: Any, ndi_name: str) -> tuple[Any, dict[str, Any]]:
+    pipeline = Gst.Pipeline.new("twitch-to-ndi")
+    if pipeline is None:
+        raise RuntimeError("Could not create GStreamer pipeline")
+
+    appsrc = Gst.ElementFactory.make("appsrc", "stream_input")
+    parser = Gst.ElementFactory.make("parsebin", "stream_parser")
+    combiner = Gst.ElementFactory.make("ndisinkcombiner", "av_combiner")
+    sync = Gst.ElementFactory.make("clocksync", "delay_sync")
+    valve = Gst.ElementFactory.make("valve", "output_valve")
+    sink = Gst.ElementFactory.make("ndisink", "ndi_output")
+    video_queue = Gst.ElementFactory.make("queue", "video_delay_queue")
+    video_decoder = Gst.ElementFactory.make("d3d11h264dec", "video_decoder")
+    video_download = Gst.ElementFactory.make("d3d11download", "video_download")
+    video_caps = Gst.ElementFactory.make("capsfilter", "ndi_video_caps")
+    audio_queue = Gst.ElementFactory.make("queue", "audio_delay_queue")
+    audio_decoder = Gst.ElementFactory.make("mfaacdec", "audio_decoder")
+    audio_convert = Gst.ElementFactory.make("audioconvert", "audio_convert")
+    audio_resample = Gst.ElementFactory.make("audioresample", "audio_resample")
+
+    elements = {
+        "appsrc": appsrc, "parsebin": parser, "ndisinkcombiner": combiner,
+        "delay_sync": sync, "output_valve": valve, "ndisink": sink,
+        "video_delay_queue": video_queue, "d3d11h264dec": video_decoder,
+        "d3d11download": video_download, "ndi_video_caps": video_caps,
+        "audio_delay_queue": audio_queue,
+        "mfaacdec": audio_decoder, "audioconvert": audio_convert,
+        "audioresample": audio_resample,
+    }
+    missing = [name for name, element in elements.items() if element is None]
+    if missing:
+        raise RuntimeError("Missing GStreamer elements: " + ", ".join(missing))
+
+    for name in ("video_delay_queue", "audio_delay_queue"):
+        element = elements[name]
+        for prop in ("current-level-time", "current-level-bytes", "max-size-time", "max-size-bytes", "max-size-buffers"):
+            if element.find_property(prop) is None:
+                raise RuntimeError(f"Required property {prop} is not available on {name}")
+        element.set_property("max-size-time", QUEUE_MAX_TIME_NS)
+        element.set_property("max-size-bytes", QUEUE_MAX_BYTES)
+        element.set_property("max-size-buffers", QUEUE_MAX_BUFFERS)
+
+    appsrc.set_property("is-live", True)
+    appsrc.set_property("format", Gst.Format.TIME)
+    appsrc.set_property("block", True)
+    appsrc.set_property("max-bytes", APP_SOURCE_MAX_BYTES)
+    appsrc.set_property("stream-type", 0)  # GST_APP_STREAM_TYPE_STREAM
+    sink.set_property("ndi-name", ndi_name)
+    sync.set_property("ts-offset", INITIAL_DELAY_MS * 1_000_000)
+    valve.set_property("drop", False)
+
+    for element in elements.values():
+        pipeline.add(element)
+
+    if not appsrc.link(parser):
+        raise RuntimeError("Could not link appsrc to parsebin")
+    if not combiner.link(sync) or not sync.link(valve) or not valve.link(sink):
+        raise RuntimeError("Could not link the NDI output path")
+    if not video_queue.link_filtered(
+        video_decoder, Gst.Caps.from_string("video/x-h264")
+    ):
+        raise RuntimeError("Could not link H.264 queue to decoder")
+    video_caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=NV12"))
+    if not video_decoder.link(video_download) or not video_download.link(video_caps):
+        raise RuntimeError("Could not link video decoder to NDI combiner")
+    video_pad = combiner.get_static_pad("video")
+    if video_pad is None or video_caps.get_static_pad("src").link(video_pad) != Gst.PadLinkReturn.OK:
+        raise RuntimeError("Could not link video to NDI combiner request pad")
+    if not audio_queue.link_filtered(
+        audio_decoder, Gst.Caps.from_string("audio/mpeg,mpegversion=4")
+    ):
+        raise RuntimeError("Could not link AAC queue to decoder")
+    if not audio_decoder.link(audio_convert) or not audio_convert.link(audio_resample):
+        raise RuntimeError("Could not link audio decoder chain")
+    audio_caps = Gst.ElementFactory.make("capsfilter", "ndi_audio_caps")
+    if audio_caps is None:
+        raise RuntimeError("Missing GStreamer capsfilter")
+    audio_caps.set_property("caps", Gst.Caps.from_string(
+        "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2"
+    ))
+    pipeline.add(audio_caps)
+    if not audio_resample.link(audio_caps):
+        raise RuntimeError("Could not link audio chain to NDI combiner")
+    audio_pad = combiner.request_pad_simple("audio")
+    if audio_pad is None or audio_caps.get_static_pad("src").link(audio_pad) != Gst.PadLinkReturn.OK:
+        raise RuntimeError("Could not link audio to NDI combiner request pad")
+
+    linked_pads: set[int] = set()
+
+    def on_demux_pad(_element: Any, pad: Any) -> None:
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        if caps is None or caps.get_size() == 0:
+            return
+        media_type = caps.get_structure(0).get_name()
+        if media_type == "video/x-h264":
+            target = video_queue.get_static_pad("sink")
+        elif media_type == "audio/mpeg":
+            target = audio_queue.get_static_pad("sink")
+        else:
+            return
+        if target is None or hash(target) in linked_pads or target.is_linked():
+            return
+        result = pad.link(target)
+        if result == Gst.PadLinkReturn.OK:
+            linked_pads.add(hash(target))
+            print(f"Linked parsed {media_type} stream", flush=True)
+        else:
+            print(f"Could not link parsed {media_type} stream: {result.value_nick}", file=sys.stderr, flush=True)
+
+    parser.connect("pad-added", on_demux_pad)
+    elements["ndi_audio_caps"] = audio_caps
+    return pipeline, elements
+
+
+@dataclass
+class Adjustment:
+    old_delay_ms: int
+    new_delay_ms: int
+    direction: str
+    started_at: float
+    video_start_ns: int
+    audio_start_ns: int
+    video_start_bytes: int
+    audio_start_bytes: int
+    stall_warning_emitted: bool = False
+    last_report_at: float = 0.0
+
+
+class DelayController:
+    def __init__(self, GLib: Any, elements: dict[str, Any]) -> None:
+        self.GLib = GLib
+        self.elements = elements
+        self.delay_ms = INITIAL_DELAY_MS
+        self.adjustment: Adjustment | None = None
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _validate(delay_ms: int) -> int:
+        if not 0 <= delay_ms <= MAX_DELAY_MS:
+            raise ValueError(f"Delay must be between 0 and {MAX_DELAY_MS} ms")
+        return delay_ms
+
+    def set_delay_ms(self, delay_ms: int) -> None:
+        delay_ms = self._validate(delay_ms)
+        with self._lock:
+            if self.adjustment is not None:
+                raise RuntimeError("Delay adjustment already in progress")
+            old_delay_ms = self.delay_ms
+            if delay_ms == old_delay_ms:
+                print(f"Delay remains {delay_ms} ms", flush=True)
+                return
+            if delay_ms > old_delay_ms:
+                self.delay_ms = delay_ms
+                self.elements["delay_sync"].set_property("ts-offset", delay_ms * 1_000_000)
+                print(f"Delay adjustment: {old_delay_ms}ms -> {delay_ms}ms", flush=True)
+                return
+
+            video = self.elements["video_delay_queue"]
+            audio = self.elements["audio_delay_queue"]
+            video_level = int(video.get_property("current-level-time"))
+            audio_level = int(audio.get_property("current-level-time"))
+            video_bytes = int(video.get_property("current-level-bytes"))
+            audio_bytes = int(audio.get_property("current-level-bytes"))
+            self.adjustment = Adjustment(
+                old_delay_ms, delay_ms, "decreasing", time.monotonic(),
+                video_level, audio_level, video_bytes, audio_bytes,
+            )
+            self.delay_ms = delay_ms
+            self.elements["output_valve"].set_property("drop", True)
+            self.elements["delay_sync"].set_property("ts-offset", delay_ms * 1_000_000)
+            print(
+                f"Delay adjustment: {old_delay_ms}ms -> {delay_ms}ms; "
+                f"Video queue: {video_level / 1e6:.0f}ms -> pending; "
+                f"Audio queue: {audio_level / 1e6:.0f}ms -> pending",
+                flush=True,
+            )
+            self.GLib.timeout_add(QUEUE_POLL_INTERVAL_MS, self._poll_decrease)
+
+    def increase_delay_ms(self, amount_ms: int) -> None:
+        if amount_ms <= 0:
+            raise ValueError("Delay change amount must be positive")
+        self.set_delay_ms(self.delay_ms + amount_ms)
+
+    def decrease_delay_ms(self, amount_ms: int) -> None:
+        if amount_ms <= 0:
+            raise ValueError("Delay change amount must be positive")
+        self.set_delay_ms(self.delay_ms - amount_ms)
+
+    def _poll_decrease(self) -> bool:
+        with self._lock:
+            adjustment = self.adjustment
+            if adjustment is None:
+                return False
+            video = self.elements["video_delay_queue"]
+            audio = self.elements["audio_delay_queue"]
+            video_now = int(video.get_property("current-level-time"))
+            audio_now = int(audio.get_property("current-level-time"))
+            video_bytes = int(video.get_property("current-level-bytes"))
+            audio_bytes = int(audio.get_property("current-level-bytes"))
+            reduction_ns = (adjustment.old_delay_ms - adjustment.new_delay_ms) * 1_000_000
+            video_reduction = adjustment.video_start_ns - video_now
+            audio_reduction = adjustment.audio_start_ns - audio_now
+            elapsed = time.monotonic() - adjustment.started_at
+            report_progress = elapsed - adjustment.last_report_at >= QUEUE_LOG_INTERVAL_MS / 1_000
+            enough = reduction_ns - QUEUE_TOLERANCE_NS
+            if video_reduction >= enough and audio_reduction >= enough:
+                self.elements["output_valve"].set_property("drop", False)
+                self.adjustment = None
+                print("Delay adjustment complete", flush=True)
+                return False
+            if report_progress:
+                adjustment.last_report_at = elapsed
+                print(
+                    f"Delay adjustment progress: video={video_now / 1e6:.0f}ms "
+                    f"({video_bytes}B, reduced {video_reduction / 1e6:.0f}ms), "
+                    f"audio={audio_now / 1e6:.0f}ms "
+                    f"({audio_bytes}B, reduced {audio_reduction / 1e6:.0f}ms)",
+                    flush=True,
+                )
+            if elapsed >= QUEUE_STALL_WARNING_SECONDS and not adjustment.stall_warning_emitted:
+                adjustment.stall_warning_emitted = True
+                print(
+                    "Warning: Delay queues have not shrunk enough; continuing to drop NDI output",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return True
+
+    def status(self) -> str:
+        with self._lock:
+            video = self.elements["video_delay_queue"]
+            audio = self.elements["audio_delay_queue"]
+            adjustment = self.adjustment
+            lines = [f"Configured delay: {self.delay_ms} ms", f"Adjusting: {adjustment is not None}"]
+            if adjustment:
+                lines.append(f"Direction: {adjustment.direction}")
+            for label, element in (("Video queue", video), ("Audio queue", audio)):
+                level_ns = int(element.get_property("current-level-time"))
+                level_bytes = int(element.get_property("current-level-bytes"))
+                lines.extend((f"{label}:", f"  time: {level_ns / 1e9:.3f} s", f"  bytes: {level_bytes}"))
+            return "\n".join(lines)
+
+
+class Runtime:
+    def __init__(self, Gst: Any, GLib: Any, pipeline: Any, elements: dict[str, Any]) -> None:
+        self.Gst = Gst
+        self.GLib = GLib
+        self.pipeline = pipeline
+        self.elements = elements
+        self.loop = GLib.MainLoop()
+        self.commands: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.failed: BaseException | None = None
+        self.controller = DelayController(GLib, elements)
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
+        GLib.timeout_add(25, self._drain_commands)
+
+    def _on_bus_message(self, _bus: Any, message: Any) -> None:
+        if message.type == self.Gst.MessageType.ERROR:
+            error, debug = message.parse_error()
+            self.failed = RuntimeError(f"GStreamer error: {error}; {debug or ''}")
+            self.loop.quit()
+        elif message.type == self.Gst.MessageType.EOS:
+            self.loop.quit()
+
+    def _drain_commands(self) -> bool:
+        while True:
+            try:
+                command, value = self.commands.get_nowait()
+            except queue.Empty:
+                return True
+            try:
+                if command == "delay":
+                    self.controller.set_delay_ms(value)
+                    print(f"Configured delay: {self.controller.delay_ms} ms", flush=True)
+                elif command == "status":
+                    print(self.controller.status(), flush=True)
+                elif command == "quit":
+                    self.loop.quit()
+                    return False
+            except (RuntimeError, ValueError) as error:
+                print(f"Error: {error}", file=sys.stderr, flush=True)
+
+
+def pump_stream(stream_io: Any, appsrc: Any, Gst: Any, stop: threading.Event, errors: queue.Queue[BaseException]) -> None:
+    try:
+        while not stop.is_set():
+            chunk = stream_io.read(CHUNK_SIZE)
+            if not chunk:
+                appsrc.emit("end-of-stream")
+                return
+            buffer = Gst.Buffer.new_allocate(None, len(chunk), None)
+            buffer.fill(0, chunk)
+            result = appsrc.emit("push-buffer", buffer)
+            if result != Gst.FlowReturn.OK:
+                if not stop.is_set() and result != Gst.FlowReturn.FLUSHING:
+                    errors.put(RuntimeError(f"GStreamer appsrc rejected data: {result.value_nick}"))
+                return
+    except BaseException as error:
+        if not stop.is_set():
+            errors.put(error)
+
+
+def console_input(commands: queue.Queue[tuple[str, Any]], stop: threading.Event) -> None:
+    print("Commands: delay <0..30000>, status, quit", flush=True)
+    while not stop.is_set():
+        try:
+            line = input("> ").strip()
+        except (EOFError, OSError):
+            commands.put(("quit", None))
+            return
+        if not line:
+            continue
+        if line == "status":
+            commands.put(("status", None))
+        elif line == "quit":
+            commands.put(("quit", None))
+            return
+        elif line.startswith("delay "):
+            try:
+                delay_ms = int(line.split(maxsplit=1)[1])
+                commands.put(("delay", delay_ms))
+            except (ValueError, IndexError):
+                print("Usage: delay <0..30000>", file=sys.stderr, flush=True)
+        elif line[0] in "+-" and line[1:].isdigit():
+            print("Use 'delay <milliseconds>' to set a new delay", flush=True)
+        else:
+            print("Commands: delay <0..30000>, status, quit", flush=True)
 
 
 def run(url: str, ndi_name: str) -> int:
-    session = Streamlink()
     stream_io = None
-    process = None
+    runtime: Runtime | None = None
+    stop = threading.Event()
+    pump_thread: threading.Thread | None = None
+    console_thread: threading.Thread | None = None
     try:
+        Gst, GLib = load_gst()
+        Gst.init(None)
+        session = Streamlink()
         _, plugin_class, resolved_url = session.resolve_url(url)
         plugin = plugin_class(session, resolved_url)
         streams = plugin.streams()
         if not streams:
             raise ValueError("Twitch returned no streams (the channel may be offline)")
-
-        names = list(streams)
         print("Available streams:")
-        print(", ".join(names))
+        print(", ".join(streams))
         selected_name, selected_stream = select_stream(plugin, streams)
-        print("\nSelected:")
-        print(selected_name)
-        print("\nNDI name:")
-        print(ndi_name)
+        print(f"\nSelected: {selected_name}\nNDI name: {ndi_name}", flush=True)
 
+        pipeline, elements = build_pipeline(Gst, ndi_name)
+        runtime = Runtime(Gst, GLib, pipeline, elements)
         stream_io = selected_stream.open()
-        process = subprocess.Popen(
-            make_pipeline(ndi_name),
-            stdin=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        result = pipeline.set_state(Gst.State.PLAYING)
+        if result == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("Could not start GStreamer pipeline")
+        pump_errors: queue.Queue[BaseException] = queue.Queue()
+        pump_thread = threading.Thread(
+            target=pump_stream,
+            args=(stream_io, elements["appsrc"], Gst, stop, pump_errors),
+            name="streamlink-pump",
+            daemon=True,
         )
-        assert process.stdin is not None
-        while True:
-            chunk = stream_io.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            process.stdin.write(chunk)
-        process.stdin.close()
-        return_code = process.wait()
-        if return_code:
-            raise RuntimeError(f"GStreamer exited with status {return_code}")
+        pump_thread.start()
+        console_thread = threading.Thread(
+            target=console_input, args=(runtime.commands, stop), name="delay-console", daemon=True
+        )
+        console_thread.start()
+        watcher_id = GLib.timeout_add(100, lambda: _check_pump_error(runtime, pump_errors))
+        try:
+            runtime.loop.run()
+        finally:
+            GLib.source_remove(watcher_id)
+        if runtime.failed:
+            raise runtime.failed
         return 0
     except KeyboardInterrupt:
-        print("\nStopping...", file=sys.stderr)
+        print("\nStopping...", file=sys.stderr, flush=True)
         return 0
-    except (StreamlinkError, OSError, ValueError, RuntimeError, BrokenPipeError) as error:
-        print(f"Error: {error}", file=sys.stderr)
+    except (StreamlinkError, OSError, ValueError, RuntimeError) as error:
+        print(f"Error: {error}", file=sys.stderr, flush=True)
         return 1
     except Exception as error:
-        print(f"Unexpected error: {error}", file=sys.stderr)
+        print(f"Unexpected error: {error}", file=sys.stderr, flush=True)
         return 1
     finally:
+        stop.set()
+        if runtime is not None:
+            runtime.pipeline.set_state(runtime.Gst.State.NULL)
         if stream_io is not None:
             try:
                 stream_io.close()
             except Exception:
                 pass
-        if process is not None:
-            if process.stdin is not None and not process.stdin.closed:
-                try:
-                    process.stdin.close()
-                except OSError:
-                    pass
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+        if pump_thread is not None:
+            pump_thread.join(timeout=2)
+
+
+def _check_pump_error(runtime: Runtime, errors: queue.Queue[BaseException]) -> bool:
+    try:
+        error = errors.get_nowait()
+    except queue.Empty:
+        return True
+    runtime.failed = RuntimeError(f"Streamlink input error: {error}")
+    runtime.loop.quit()
+    return False
 
 
 def main() -> None:

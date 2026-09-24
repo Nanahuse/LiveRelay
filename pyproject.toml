@@ -7,7 +7,11 @@ name = "twitch-to-ndi"
 version = "0.1.0"
 description = "Relay a Twitch live stream to an NDI source"
 requires-python = ">=3.14"
-dependencies = ["streamlink>=7.0"]
+dependencies = [
+    "streamlink>=7.0",
+    "PyGObject>=3.50; sys_platform != 'win32'",
+    "gstreamer-python==1.28.6; sys_platform == 'win32'",
+]
 
 [project.scripts]
 twitch-to-ndi = "twitch_to_ndi.main:main"
