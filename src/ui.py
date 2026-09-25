@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
-try:
-    from .controller import SingleStreamController
-except ImportError:  # Allow `uv run path\to\ui.py` from a source checkout.
-    from controller import SingleStreamController
+from controller import SingleStreamController
 
 
 DELAY_STEPS_MS = (5000, 1000, 500, 100)
@@ -19,7 +16,7 @@ class RelayWindow:
         self._local_error: str | None = None
         self._delay_buttons: list[tuple[tk.Button, int]] = []
 
-        root.title("Twitch → NDI")
+        root.title("LiveRelay")
         root.geometry("660x500")
         root.minsize(620, 450)
         root.protocol("WM_DELETE_WINDOW", self.on_close)

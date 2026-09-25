@@ -21,7 +21,7 @@ GI_SITE_PACKAGES = (
 
 def main() -> None:
     if sys.platform != "win32":
-        raise RuntimeError("The TwitchToNDI onedir bundle must be built on Windows.")
+        raise RuntimeError("The LiveRelay onedir bundle must be built on Windows.")
     if not (GST_RUNTIME / "bin" / "gst-launch-1.0.exe").is_file():
         raise FileNotFoundError(
             f"Private GStreamer Runtime is missing: {GST_RUNTIME}. "
@@ -39,7 +39,7 @@ def main() -> None:
             "--contents-directory",
             ".",
             "--name",
-            "TwitchToNDI",
+            "LiveRelay",
             "--paths",
             str(ROOT / "src"),
             "--paths",
@@ -57,7 +57,7 @@ def main() -> None:
     # Keep the complete GStreamer tree as data in its intended subdirectory.
     # PyInstaller otherwise reclassifies DLL data as binaries and flattens it
     # into the executable directory, ahead of the private DLL search path.
-    output_root = ROOT / "dist" / "TwitchToNDI"
+    output_root = ROOT / "dist" / "LiveRelay"
     shutil.copytree(GST_RUNTIME, output_root / "runtime" / "gstreamer", dirs_exist_ok=True)
     for source in (GST_RUNTIME / "bin").glob("*.dll"):
         (output_root / source.name).unlink(missing_ok=True)

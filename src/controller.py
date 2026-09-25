@@ -9,7 +9,7 @@ from typing import Any
 from streamlink import Streamlink
 from streamlink.exceptions import StreamlinkError
 
-from .main import (
+from main import (
     INITIAL_DELAY_MS,
     MAX_DELAY_MS,
     Runtime,

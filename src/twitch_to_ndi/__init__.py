@@ -1,1 +1,0 @@
-"""Twitch to NDI relay."""

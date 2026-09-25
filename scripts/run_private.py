@@ -45,14 +45,14 @@ def main() -> int:
     if getattr(sys, "frozen", False):
         log_directory = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "LiveRelay" / "logs"
         log_directory.mkdir(parents=True, exist_ok=True)
-        log_file = (log_directory / "twitch-to-ndi.log").open("a", encoding="utf-8", buffering=1)
+        log_file = (log_directory / "liverelay.log").open("a", encoding="utf-8", buffering=1)
         sys.stdout = log_file
         sys.stderr = log_file
 
     sys.path.insert(0, str(root / "src"))
     gst_root, ndi_root = configure_private_environment(root)
 
-    from twitch_to_ndi.main import load_gst
+    from main import load_gst
 
     Gst, _GLib = load_gst()
     Gst.init(None)
@@ -99,7 +99,7 @@ def main() -> int:
         print("Private GStreamer and environment NDI Runtime checks passed.")
         return 0
 
-    from twitch_to_ndi.ui import main as ui_main
+    from ui import main as ui_main
 
     ui_main()
     return 0

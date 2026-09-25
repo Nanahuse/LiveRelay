@@ -653,7 +653,7 @@ def _check_pump_error(runtime: Runtime, errors: queue.Queue[BaseException]) -> b
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="twitch-to-ndi")
+    parser = argparse.ArgumentParser(prog="LiveRelay")
     parser.add_argument("url", help="Twitch channel URL")
     parser.add_argument("--ndi-name", required=True, help="NDI source name")
     args = parser.parse_args()

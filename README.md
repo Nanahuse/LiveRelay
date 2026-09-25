@@ -14,7 +14,7 @@ Install the locked dependencies and launch the Tkinter interface:
 
 ```powershell
 uv sync
-uv run twitch-to-ndi
+uv run liverelay
 ```
 
 ## Private Runtime investigation
@@ -65,22 +65,22 @@ uv sync --group build
 uv run --group build python packaging/build.py
 ```
 
-The onedir output is `dist/TwitchToNDI/TwitchToNDI.exe`, with
+The onedir output is `dist/LiveRelay/LiveRelay.exe`, with
 `runtime/gstreamer` beside the executable. Run the bundled dependency check
 with:
 
 ```powershell
-.\dist\TwitchToNDI\TwitchToNDI.exe --check-only
+.\dist\LiveRelay\LiveRelay.exe --check-only
 ```
 
 The windowed executable writes diagnostics to
-`%LOCALAPPDATA%\LiveRelay\logs\twitch-to-ndi.log` and stores its private
+`%LOCALAPPDATA%\LiveRelay\logs\liverelay.log` and stores its private
 GStreamer registry under `%LOCALAPPDATA%\LiveRelay\cache`.
 
 The previous command-line interface remains available:
 
 ```powershell
-twitch-to-ndi-cli https://www.twitch.tv/example --ndi-name "Runner A"
+liverelay-cli https://www.twitch.tv/example --ndi-name "Runner A"
 ```
 
 The GUI selects the lowest Twitch pixel-weight quality at 480p or higher and requests Streamlink's Twitch low-latency mode. Twitch broadcasters must enable low-latency streaming for their channels; regular streams may buffer with this option. The GUI starts with a 0-second delay, supports 0–30 seconds in 0.1-second steps or larger buttons, and stops the stream when the window closes. Reducing delay drops the combined NDI output while the compressed queues drain; H.264/AAC buffers continue through their decoders.
@@ -89,7 +89,7 @@ For detailed Streamlink read and GStreamer queue timing in the terminal, enable 
 
 ```powershell
 $env:TWITCH_TO_NDI_DIAGNOSTICS = "1"
-uv run twitch-to-ndi
+uv run liverelay
 ```
 
 Check the GStreamer prerequisites with:

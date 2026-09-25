@@ -14,13 +14,16 @@ dependencies = [
 ]
 
 [project.scripts]
-twitch-to-ndi = "twitch_to_ndi.ui:main"
-twitch-to-ndi-cli = "twitch_to_ndi.main:main"
+liverelay = "ui:main"
+liverelay-cli = "main:main"
+twitch-to-ndi = "ui:main"
+twitch-to-ndi-cli = "main:main"
 
 [dependency-groups]
 build = [
     "pyinstaller==6.22.3",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["controller", "main", "ui"]
