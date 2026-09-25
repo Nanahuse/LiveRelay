@@ -53,6 +53,7 @@ class SingleStreamController:
         self._audio_rate: int | None = None
         self._delay_ms = INITIAL_DELAY_MS
         self._target_delay_ms = INITIAL_DELAY_MS
+        self._delay_pending = False
         self._adjusting = False
         self._video_buffer_ms = 0
         self._audio_buffer_ms = 0
@@ -110,6 +111,7 @@ class SingleStreamController:
             self._audio_buffer_ms = 0
             self._error = None
             self._adjusting = False
+            self._delay_pending = False
             self._state = "starting"
             self._stop_event = threading.Event()
             worker = threading.Thread(target=self._run_stream, name="single-stream-controller", daemon=True)
@@ -143,11 +145,13 @@ class SingleStreamController:
             if self._state in ("stopped", "error"):
                 self._delay_ms = target
                 self._target_delay_ms = target
+                self._delay_pending = False
                 return
             runtime = self._runtime
             if runtime is None:
                 raise RuntimeError("Stream controls are not ready yet.")
             self._target_delay_ms = target
+            self._delay_pending = True
             if amount_ms < 0:
                 self._adjusting = True
                 self._state = "adjusting"
@@ -169,13 +173,16 @@ class SingleStreamController:
                     self._state = "running"
             elif event == "error":
                 self._error = self._short_error(value)
+                self._delay_pending = False
                 self._state = "error"
             elif event == "runtime_snapshot":
                 self._delay_ms = int(value["delay_ms"])
-                # Runtime reports its committed value on the next polling tick.
-                # Keep a pending UI target until that value catches up, otherwise
-                # the delay label alternates between old and new values.
-                if self._target_delay_ms == self._delay_ms or not self._adjusting:
+                # Keep the requested UI value until the runtime acknowledges it.
+                # This also covers increases, whose buffer adjustment is immediate
+                # and therefore does not set _adjusting.
+                if self._delay_pending and self._target_delay_ms == self._delay_ms:
+                    self._delay_pending = False
+                elif not self._delay_pending:
                     self._target_delay_ms = self._delay_ms
                 self._video_buffer_ms = int(value["video_buffer_ms"])
                 self._audio_buffer_ms = int(value["audio_buffer_ms"])
@@ -268,6 +275,7 @@ class SingleStreamController:
             with self._lock:
                 self._runtime = None
                 self._adjusting = False
+                self._delay_pending = False
                 if self._state != "error":
                     self._state = "stopped"
 

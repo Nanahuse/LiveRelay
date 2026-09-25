@@ -39,7 +39,16 @@ def main() -> int:
         "--check-only", action="store_true",
         help="Verify isolated GStreamer and NDI runtime loading without opening the UI.",
     )
+    parser.add_argument(
+        "--cli-url",
+        help="Run a stream directly through the private runtime instead of opening the UI.",
+    )
+    parser.add_argument("--ndi-name", help="NDI source name for --cli-url.")
     args = parser.parse_args()
+    if bool(args.cli_url) != bool(args.ndi_name):
+        parser.error("--cli-url and --ndi-name must be provided together")
+    if args.check_only and args.cli_url:
+        parser.error("--check-only cannot be combined with --cli-url")
 
     root = workspace_root()
     if getattr(sys, "frozen", False):
@@ -87,7 +96,7 @@ def main() -> int:
     ndi_library = ndi_root / "Processing.NDI.Lib.x64.dll"
     if not ndi_library.is_file():
         raise RuntimeError(
-            "NDI Runtime was not found in NDI_RUNTIME_DIR_V6 or runtime/ndi."
+            "Installed NDI Runtime was not found. Set NDI_RUNTIME_DIR_V6 to its directory."
         )
     ctypes.WinDLL(str(ndi_library))
     ndi_path = loaded_module_path(ndi_library.name)
@@ -98,6 +107,11 @@ def main() -> int:
     if args.check_only:
         print("Private GStreamer and environment NDI Runtime checks passed.")
         return 0
+
+    if args.cli_url:
+        from main import run as run_cli
+
+        return run_cli(args.cli_url, args.ndi_name)
 
     from ui import main as ui_main
 

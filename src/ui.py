@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+import webbrowser
 
 from controller import SingleStreamController
 
@@ -41,7 +42,16 @@ class RelayWindow:
         self.url_entry = tk.Entry(body, textvariable=self.url_var, width=72)
         self.url_entry.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(0, 9))
 
-        tk.Label(body, text="NDI Source Name").grid(row=2, column=0, sticky="w", pady=(0, 3))
+        tk.Label(body, text="NDI® Source Name").grid(row=2, column=0, sticky="w", pady=(0, 3))
+        ndi_attribution = tk.Label(
+            body,
+            text="NDI® is a registered trademark of Vizrt NDI AB · ndi.video",
+            anchor="e",
+            cursor="hand2",
+            fg="#0759a5",
+        )
+        ndi_attribution.grid(row=2, column=1, columnspan=3, sticky="e", pady=(0, 3))
+        ndi_attribution.bind("<Button-1>", lambda _event: webbrowser.open("https://ndi.video/"))
         self.ndi_entry = tk.Entry(body, textvariable=self.ndi_var, width=48)
         self.ndi_entry.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 9))
         self.start_button = tk.Button(body, text="Start", width=12, command=self.on_start)

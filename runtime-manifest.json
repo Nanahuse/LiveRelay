@@ -58,7 +58,7 @@
     }
   ],
   "notes": {
-    "ndi_runtime": "Local verification uses NDI_RUNTIME_DIR_V6 when available, otherwise runtime/ndi. For redistribution, follow official NDI SDK terms, attribution, and third-party notice requirements.",
+    "ndi_runtime": "Local verification uses the runtime selected by NDI_RUNTIME_DIR_V6. Follow official NDI SDK terms, attribution, and third-party notice requirements.",
     "containers": ["MPEG-TS", "fragmented MP4 / ISO BMFF"]
   }
 }

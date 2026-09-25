@@ -5,10 +5,10 @@ Minimal Twitch live stream to NDI relay for Windows.
 ## Requirements
 
 - Python 3.14 or newer, managed with `uv`
-- GStreamer 1.28.6 MSVC x86_64 Full Runtime in `runtime/gstreamer` (or at the existing GStreamer path for the conventional launcher)
+- GStreamer 1.28.6 MSVC x86_64 Full Runtime source in `runtime-source/gstreamer-full`; generate the private runtime under `runtime/gstreamer`
 - Matching `gstreamer-python` bindings (declared in the script metadata)
 - GStreamer elements: `parsebin`, `d3d11h264dec`, `d3d11download`, `mfaacdec`, `ndisinkcombiner`, and `ndisink`
-- NDI Runtime installed
+- NDI Runtime installed locally and selected through `NDI_RUNTIME_DIR_V6`
 
 Install the locked dependencies and launch the Tkinter interface:
 
@@ -39,9 +39,9 @@ uv run python scripts/run_private.py
 ```
 
 The launch checks that required GStreamer modules resolve inside
-`runtime/gstreamer`. For local testing it uses the installed NDI runtime
-selected by `NDI_RUNTIME_DIR_V6`; otherwise it can use `runtime/ndi`. It never
-falls back to a system GStreamer installation. Check both runtimes without
+`runtime/gstreamer` and uses the installed NDI runtime selected through
+`NDI_RUNTIME_DIR_V6`. It never falls back to a system GStreamer installation.
+Check both runtimes without
 opening the UI with:
 
 ```powershell
@@ -52,6 +52,8 @@ For future redistribution, follow the [NDI SDK software distribution
 guide](https://docs.ndi.video/all/developing-with-ndi/sdk/software-distribution)
 and [licensing guide](https://docs.ndi.video/all/developing-with-ndi/sdk/licensing),
 including the required NDI attribution and license coverage.
+
+NDI® is a registered trademark of Vizrt NDI AB. See [ndi.video](https://ndi.video/).
 
 ## Build the Windows onedir application
 

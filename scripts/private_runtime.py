@@ -21,16 +21,8 @@ def configure_private_environment(root: Path | None = None) -> tuple[Path, Path]
 
     root = (root or workspace_root()).resolve()
     gst_root = root / "runtime" / "gstreamer"
-    private_ndi_root = root / "runtime" / "ndi"
     installed_ndi_root = Path(os.environ.get("NDI_RUNTIME_DIR_V6", "")).resolve()
-    installed_ndi_dll = installed_ndi_root / "Processing.NDI.Lib.x64.dll"
-    private_ndi_dll = private_ndi_root / "Processing.NDI.Lib.x64.dll"
-    if installed_ndi_dll.is_file():
-        ndi_root = installed_ndi_root
-    elif private_ndi_dll.is_file():
-        ndi_root = private_ndi_root.resolve()
-    else:
-        ndi_root = installed_ndi_root
+    ndi_root = installed_ndi_root
     gst_bin = gst_root / "bin"
     plugins = gst_root / "lib" / "gstreamer-1.0"
     scanner = gst_root / "libexec" / "gstreamer-1.0" / "gst-plugin-scanner.exe"
