@@ -18,12 +18,13 @@ from main import (
     pump_stream,
     select_stream,
 )
+from stream_source import resolve_stream
 
 
 @dataclass(frozen=True)
 class StreamSnapshot:
     state: str
-    twitch_url: str
+    stream_url: str
     ndi_name: str
     selected_quality: str | None
     width: int | None
@@ -66,7 +67,7 @@ class SingleStreamController:
         with self._lock:
             return StreamSnapshot(
                 state=self._state,
-                twitch_url=self._url,
+                stream_url=self._url,
                 ndi_name=self._ndi_name,
                 selected_quality=self._quality,
                 width=self._width,
@@ -88,20 +89,17 @@ class SingleStreamController:
                 self._worker is None or not self._worker.is_alive()
             )
 
-    def start(self, twitch_url: str, ndi_name: str) -> None:
-        twitch_url = twitch_url.strip()
-        ndi_name = ndi_name.strip()
-        if not twitch_url:
-            raise ValueError("Enter a Twitch URL.")
-        if not ndi_name:
-            raise ValueError("Enter an NDI Source Name.")
+    def start(self, stream_url: str, ndi_name: str = "") -> None:
+        stream_url = stream_url.strip()
+        if not stream_url:
+            raise ValueError("Enter a Stream URL.")
         with self._lock:
             if self._state not in ("stopped", "error"):
                 raise RuntimeError("The stream is already starting or running.")
             if self._worker is not None and self._worker.is_alive():
                 raise RuntimeError("The previous stream is still stopping.")
-            self._url = twitch_url
-            self._ndi_name = ndi_name
+            self._url = stream_url
+            self._ndi_name = ndi_name.strip()
             self._quality = None
             self._width = None
             self._height = None
@@ -201,19 +199,22 @@ class SingleStreamController:
         pump_thread: threading.Thread | None = None
         pump_errors: queue.Queue[BaseException] = queue.Queue()
         try:
+            session = Streamlink()
+            provider, plugin, _resolved_url, resolved_ndi_name = resolve_stream(
+                session, self._url, self._ndi_name
+            )
+            with self._lock:
+                self._ndi_name = resolved_ndi_name
             Gst, GLib = load_gst()
             Gst.init(None)
-            session = Streamlink()
-            _, plugin_class, resolved_url = session.resolve_url(self._url)
-            plugin = plugin_class(session, resolved_url, options={"low-latency": True})
             streams = plugin.streams()
             if not streams:
-                raise ValueError("Twitch returned no streams (the channel may be offline).")
+                raise ValueError(f"No live stream is available for this {provider.title()} URL.")
             selected_name, selected_stream = select_stream(plugin, streams)
             with self._lock:
                 self._quality = selected_name
                 initial_delay_ms = self._target_delay_ms
-            print(f"Selected Twitch quality: {selected_name}", flush=True)
+            print(f"Selected {provider.title()} quality: {selected_name}", flush=True)
             if self._stop_event.is_set():
                 return
 
@@ -248,7 +249,7 @@ class SingleStreamController:
             if runtime.failed is not None:
                 raise runtime.failed
             if not self._stop_event.is_set():
-                raise RuntimeError("The Twitch stream ended.")
+                raise RuntimeError("The live stream ended.")
         except (StreamlinkError, OSError, ValueError, RuntimeError) as error:
             print(f"Error: {error}", file=sys.stderr, flush=True)
             with self._lock:
