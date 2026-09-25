@@ -85,6 +85,10 @@ with:
 .\dist\LiveRelay\LiveRelay.exe --check-only
 ```
 
+The build downloads six version-pinned native license texts from upstream and
+checks their SHA-256 hashes, so an internet connection is required during the
+build.
+
 The windowed executable writes diagnostics to
 `%LOCALAPPDATA%\LiveRelay\logs\liverelay.log` and stores its private
 GStreamer registry under `%LOCALAPPDATA%\LiveRelay\cache`.

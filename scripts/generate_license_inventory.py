@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.metadata
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 
@@ -66,16 +68,35 @@ PYTHON_URLS = {
     "pycairo": "https://github.com/pygobject/pycairo",
 }
 
-# These upstream wheels omit the corresponding license files from their
-# Windows payload. Keep only those few source texts that cannot be extracted
-# from the installed distributions or the local Python/GStreamer runtimes.
-PACKAGED_LICENSE_RESOURCES = {
-    "LGPL-2.0.txt": "GNU Lesser General Public License 2.0",
-    "MPL-1.1.txt": "Mozilla Public License 1.1",
-    "libffi-LICENSE.txt": "libffi MIT license",
-    "ORC-COPYING.txt": "ORC dual BSD license text",
-    "PCRE2-LICENCE.txt": "PCRE2 license text",
-    "zlib-LICENSE.txt": "zlib license text",
+# Some native components omit their license files from the bundled Windows
+# runtime. Fetch their exact upstream versioned files into dist at build time;
+# SHA-256 pins prevent a moved tag or changed upstream file from silently
+# changing the license text included in a release.
+UPSTREAM_LICENSES = {
+    "LGPL-2.0.txt": (
+        "https://ftp.gnu.org/pub/gnu/Licenses/lgpl-2.0.txt",
+        "cc535c21133c895b56b374c8a1dc1eb948d99003ed2b47372069456b62f42b24",
+    ),
+    "MPL-1.1.txt": (
+        "https://raw.githubusercontent.com/pygobject/pycairo/v1.28.0/COPYING-MPL-1.1",
+        "53692a2ed6c6a2c6ec9b32dd0b820dfae91e0a1fcdf625ca9ed0bdf8705fcc4f",
+    ),
+    "libffi-LICENSE.txt": (
+        "https://raw.githubusercontent.com/libffi/libffi/v3.4.6/LICENSE",
+        "67894089811f93fca47a76f85e017da6f8582d4ba0905963c6e0f1ad6df7a195",
+    ),
+    "ORC-COPYING.txt": (
+        "https://raw.githubusercontent.com/GStreamer/orc/0.4.42/COPYING",
+        "4f5dabb1b44bb6fc5cd53820b1f103147ad61b395a57903991325bd1b85d97bf",
+    ),
+    "PCRE2-LICENCE.txt": (
+        "https://raw.githubusercontent.com/PCRE2Project/pcre2/pcre2-10.42/LICENCE",
+        "87d884eceb7fc54611470ce9f74280d28612b0c877adfc767e9676892a638987",
+    ),
+    "zlib-LICENSE.txt": (
+        "https://raw.githubusercontent.com/madler/zlib/v1.3.1/LICENSE",
+        "845efc77857d485d91fb3e0b884aaa929368c717ae8186b66fe1ed2495753243",
+    ),
 }
 
 NATIVE_COMPONENTS = [
@@ -127,7 +148,6 @@ def _copy_license_files(dist: importlib.metadata.Distribution, destination: Path
 
 
 def _package_record(
-    root: Path,
     output_root: Path,
     dist: importlib.metadata.Distribution,
     *,
@@ -165,7 +185,7 @@ def _package_record(
             shutil.copy2(lgpl_file, target)
             copied.append(target)
     for filename in fallback_names:
-        source = root / "packaging" / "licenses" / filename
+        source = output_root / "licenses" / "runtime" / filename
         if source.is_file():
             target = destination / filename
             shutil.copy2(source, target)
@@ -184,7 +204,7 @@ def _package_record(
     return distribution_name if name is None else name, version, license_name, relative_files, source_url
 
 
-def _write_package_licenses(root: Path, output_root: Path, package_names: set[str]) -> list[tuple[str, str, str, list[str], str]]:
+def _write_package_licenses(output_root: Path, package_names: set[str]) -> list[tuple[str, str, str, list[str], str]]:
     records = []
     for name in sorted(package_names, key=str.casefold):
         if name.casefold() == "gstreamer_python":
@@ -195,7 +215,7 @@ def _write_package_licenses(root: Path, output_root: Path, package_names: set[st
             raise RuntimeError(f"Bundled Python distribution metadata is missing: {name}") from None
         if dist.metadata["Name"].casefold() in {"setuptools", "wheel", "pyinstaller"}:
             raise RuntimeError(f"Build-only distribution was collected into the runtime: {dist.metadata['Name']}")
-        records.append(_package_record(root, output_root, dist))
+        records.append(_package_record(output_root, dist))
 
     wheel_site = Path(sys.prefix) / "Lib" / "site-packages" / "gstreamer_python" / "Lib" / "site-packages"
     for name in ("PyGObject", "pycairo"):
@@ -203,7 +223,7 @@ def _write_package_licenses(root: Path, output_root: Path, package_names: set[st
         if dist is None:
             raise RuntimeError(f"Bundled Python distribution metadata is missing: {name}")
         fallback = ("MPL-1.1.txt",) if name.casefold() == "pycairo" else ()
-        records.append(_package_record(root, output_root, dist, fallback_names=fallback))
+        records.append(_package_record(output_root, dist, fallback_names=fallback))
 
     gst_site = Path(sys.prefix) / "Lib" / "site-packages"
     gst_python_dist = next(iter(importlib.metadata.Distribution.discover(path=[str(gst_site)], name="gstreamer_python")), None)
@@ -212,14 +232,13 @@ def _write_package_licenses(root: Path, output_root: Path, package_names: set[st
     # Its wheel metadata combines licenses for the shipped bindings and support
     # files; each underlying package is inventoried separately above.
     wheel_record = _package_record(
-            root,
-            output_root,
-            gst_python_dist,
-            name="gstreamer-python wheel",
-            license_name=gst_python_dist.metadata["License"],
-            url=f"https://pypi.org/project/gstreamer-python/{gst_python_dist.version}/",
-            fallback_names=("LGPL-2.0.txt",),
-        )
+        output_root,
+        gst_python_dist,
+        name="gstreamer-python wheel",
+        license_name=gst_python_dist.metadata["License"],
+        url=f"https://pypi.org/project/gstreamer-python/{gst_python_dist.version}/",
+        fallback_names=("LGPL-2.0.txt",),
+    )
     wheel_license_files = list(wheel_record[3])
     for package in ("certifi", "pycountry", "idna", "attrs", "PyGObject", "pycairo"):
         component = next((record for record in records if record[0].casefold() == package.casefold()), None)
@@ -299,7 +318,6 @@ def _record_license_path(records: list[tuple[str, str, str, list[str], str]], pa
 
 
 def _copy_runtime_licenses(
-    root: Path,
     output_root: Path,
     package_records: list[tuple[str, str, str, list[str], str]],
 ) -> list[str]:
@@ -309,8 +327,6 @@ def _copy_runtime_licenses(
     copies = [
         (python_root / "LICENSE.txt", destination / "Python-PSF-2.0.txt"),
         (python_root / "tcl" / "tk8.6" / "license.terms", destination / "Tcl-Tk-license.terms"),
-        (root / "packaging" / "licenses" / "LGPL-2.0.txt", destination / "LGPL-2.0.txt"),
-        (root / "packaging" / "licenses" / "libffi-LICENSE.txt", destination / "libffi-LICENSE.txt"),
     ]
     copies.extend(
         [
@@ -331,21 +347,37 @@ def _copy_runtime_licenses(
     for filename, license_filename in required.items():
         if filename in bundled_names and not (destination / license_filename).is_file():
             raise RuntimeError(f"License text for bundled native component {filename} is missing")
-    return [str(target.relative_to(output_root)).replace("\\", "/") for _, target in copies]
+    copied = [str(target.relative_to(output_root)).replace("\\", "/") for _, target in copies]
+    copied.extend(
+        f"licenses/runtime/{filename}"
+        for filename in UPSTREAM_LICENSES
+    )
+    return copied
+
+
+def _download_upstream_licenses(output_root: Path) -> None:
+    destination = output_root / "licenses" / "runtime"
+    destination.mkdir(parents=True, exist_ok=True)
+    for filename, (url, expected_sha256) in UPSTREAM_LICENSES.items():
+        request = urllib.request.Request(url, headers={"User-Agent": "LiveRelay license inventory"})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                content = response.read()
+        except OSError as error:
+            raise RuntimeError(f"Unable to download upstream license {filename} from {url}: {error}") from error
+        actual_sha256 = hashlib.sha256(content).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                f"Upstream license checksum changed for {filename}: expected {expected_sha256}, got {actual_sha256}"
+            )
+        (destination / filename).write_bytes(content)
 
 
 def generate(root: Path, output_root: Path) -> None:
-    package_records = _write_package_licenses(root, output_root, _pyz_packages(root))
+    _download_upstream_licenses(output_root)
+    package_records = _write_package_licenses(output_root, _pyz_packages(root))
     gst_records = _inspect_plugins(root, output_root)
-    runtime_license_files = _copy_runtime_licenses(root, output_root, package_records)
-    licenses_root = output_root / "licenses"
-    for filename, description in PACKAGED_LICENSE_RESOURCES.items():
-        source = root / "packaging" / "licenses" / filename
-        if not source.is_file():
-            raise RuntimeError(f"Required fixed license resource is missing: {source} ({description})")
-        target = licenses_root / "runtime" / filename
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+    runtime_license_files = _copy_runtime_licenses(output_root, package_records)
 
     lines = [
         "LiveRelay Third-Party Notices",
