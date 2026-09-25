@@ -61,6 +61,8 @@ def main() -> None:
                 "streamlink",
                 "--copy-metadata",
                 "streamlink",
+                "--exclude-module",
+                "setuptools",
                 "--add-data",
                 f"{GI_SITE_PACKAGES};gstreamer-python",
                 str(ROOT / "scripts" / "run_private.py"),

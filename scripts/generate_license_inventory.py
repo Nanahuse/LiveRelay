@@ -26,7 +26,6 @@ PYTHON_LICENSES = {
     "pycryptodome": "BSD and Public Domain",
     "pysocks": "BSD",
     "requests": "Apache-2.0",
-    "setuptools": "MIT",
     "sniffio": "MIT OR Apache-2.0",
     "sortedcontainers": "Apache-2.0",
     "streamlink": "BSD-2-Clause",
@@ -37,8 +36,6 @@ PYTHON_LICENSES = {
     "wsproto": "MIT",
     "pygobject": "LGPL-2.1-or-later",
     "pycairo": "LGPL-2.1-only OR MPL-1.1",
-    "pyinstaller": "GPL-2.0-or-later with PyInstaller exception",
-    "pyinstaller-hooks-contrib": "Apache-2.0",
 }
 
 PYTHON_URLS = {
@@ -57,7 +54,6 @@ PYTHON_URLS = {
     "pycryptodome": "https://github.com/Legrandin/pycryptodome",
     "pysocks": "https://github.com/Anorov/PySocks",
     "requests": "https://github.com/psf/requests",
-    "setuptools": "https://github.com/pypa/setuptools",
     "sniffio": "https://github.com/python-trio/sniffio",
     "sortedcontainers": "https://github.com/grantjenks/python-sortedcontainers",
     "streamlink": "https://github.com/streamlink/streamlink",
@@ -68,13 +64,18 @@ PYTHON_URLS = {
     "wsproto": "https://github.com/python-hyper/wsproto",
     "pygobject": "https://github.com/GNOME/pygobject",
     "pycairo": "https://github.com/pygobject/pycairo",
-    "pyinstaller": "https://github.com/pyinstaller/pyinstaller",
-    "pyinstaller-hooks-contrib": "https://github.com/pyinstaller/pyinstaller-hooks-contrib",
 }
 
-LICENSE_FALLBACKS = {
-    "pygobject": ["LGPL-2.1.txt"],
-    "pycairo": ["LGPL-2.1.txt", "MPL-1.1.txt"],
+# These upstream wheels omit the corresponding license files from their
+# Windows payload. Keep only those few source texts that cannot be extracted
+# from the installed distributions or the local Python/GStreamer runtimes.
+PACKAGED_LICENSE_RESOURCES = {
+    "LGPL-2.0.txt": "GNU Lesser General Public License 2.0",
+    "MPL-1.1.txt": "Mozilla Public License 1.1",
+    "libffi-LICENSE.txt": "libffi MIT license",
+    "ORC-COPYING.txt": "ORC dual BSD license text",
+    "PCRE2-LICENCE.txt": "PCRE2 license text",
+    "zlib-LICENSE.txt": "zlib license text",
 }
 
 NATIVE_COMPONENTS = [
@@ -83,8 +84,7 @@ NATIVE_COMPONENTS = [
     ("libffi (Python runtime)", "3.4.6", "MIT", "https://github.com/libffi/libffi", ["libffi-8.dll"], "libffi"),
     ("zlib-ng (Python runtime)", "1.3.1.zlib-ng", "Zlib", "https://github.com/zlib-ng/zlib-ng", ["zlib1.dll"], "zlib"),
     ("Tcl/Tk", "8.6.14", "Tcl/Tk license", "https://www.tcl-lang.org/software/tcltk/", ["tcl86t.dll", "tk86t.dll"], "tcltk"),
-    ("Microsoft Visual C++ Runtime", "14.44.35211.0", "Microsoft software license terms", "https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist", ["vcruntime140.dll", "vcruntime140_1.dll"], "msvc"),
-    ("GStreamer", "1.28.6", "LGPL-2.1-or-later", "https://gstreamer.freedesktop.org/src/", [], "gstreamer"),
+    ("Microsoft Visual C++ Runtime", "14.44.35211.0", "Microsoft software license terms", "https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files", ["vcruntime140.dll", "vcruntime140_1.dll"], "msvc"),
 ]
 
 GST_SOURCES = {
@@ -110,145 +110,122 @@ def _source_url(name: str, version: str) -> str:
     return f"https://gstreamer.freedesktop.org/src/{name}/{name}-{version}.tar.xz"
 
 
-def _write_package_licenses(root: Path, package_names: set[str]) -> list[tuple[str, str, str, list[str], str]]:
-    records: list[tuple[str, str, str, list[str], str]] = []
-    licenses_root = root / "licenses" / "python"
-    if licenses_root.exists():
-        shutil.rmtree(licenses_root)
-    licenses_root.mkdir(parents=True, exist_ok=True)
+def _copy_license_files(dist: importlib.metadata.Distribution, destination: Path) -> list[Path]:
+    copied: list[Path] = []
+    for item in dist.files or ():
+        filename = Path(str(item)).name
+        if not filename.casefold().startswith(("license", "copying", "notice")):
+            continue
+        source = Path(dist.locate_file(item))
+        if source.is_file():
+            target = destination / filename
+            if target.exists() and target.read_bytes() != source.read_bytes():
+                target = destination / f"{Path(str(item)).parent.name}-{filename}"
+            shutil.copy2(source, target)
+            copied.append(target)
+    return copied
+
+
+def _package_record(
+    root: Path,
+    output_root: Path,
+    dist: importlib.metadata.Distribution,
+    *,
+    name: str | None = None,
+    license_name: str | None = None,
+    url: str | None = None,
+    fallback_names: tuple[str, ...] = (),
+) -> tuple[str, str, str, list[str], str]:
+    distribution_name = dist.metadata.get("Name", name or "unknown")
+    canonical = distribution_name.casefold()
+    version = dist.version
+    license_name = license_name or PYTHON_LICENSES.get(canonical)
+    if not license_name:
+        raise RuntimeError(f"No reviewed license mapping for bundled Python package {distribution_name}")
+    licenses_root = output_root / "licenses" / "python"
+    destination = licenses_root / f"{distribution_name}-{version}"
+    destination.mkdir(parents=True, exist_ok=True)
+    copied = _copy_license_files(dist, destination)
+    if canonical in {"pygobject", "pycairo"} and not copied:
+        # These bindings are nested inside the gstreamer-python wheel and omit
+        # license files. The installed pycountry runtime distribution carries
+        # the complete LGPL-2.1 text needed by both bindings.
+        lgpl_dist = importlib.metadata.distribution("pycountry")
+        lgpl_file = next(
+            (
+                Path(lgpl_dist.locate_file(item))
+                for item in lgpl_dist.files or ()
+                if Path(str(item)).name.casefold().startswith(("license", "copying"))
+                and Path(lgpl_dist.locate_file(item)).is_file()
+            ),
+            None,
+        )
+        if lgpl_file is not None:
+            target = destination / "LGPL-2.1.txt"
+            shutil.copy2(lgpl_file, target)
+            copied.append(target)
+    for filename in fallback_names:
+        source = root / "packaging" / "licenses" / filename
+        if source.is_file():
+            target = destination / filename
+            shutil.copy2(source, target)
+            copied.append(target)
+    if not copied:
+        raise RuntimeError(f"No license text found for bundled Python package {distribution_name} {version}")
+    source_url = url or PYTHON_URLS.get(canonical) or dist.metadata.get("Home-page")
+    if not source_url:
+        source_url = next(
+            (value.split(", ", 1)[1] for key, value in dist.metadata.items() if key == "Project-URL" and value.startswith(("Source", "Repository"))),
+            "",
+        )
+    if not source_url:
+        raise RuntimeError(f"No source URL recorded for bundled Python package {distribution_name}")
+    relative_files = [path.relative_to(output_root).as_posix() for path in copied]
+    return distribution_name if name is None else name, version, license_name, relative_files, source_url
+
+
+def _write_package_licenses(root: Path, output_root: Path, package_names: set[str]) -> list[tuple[str, str, str, list[str], str]]:
+    records = []
     for name in sorted(package_names, key=str.casefold):
+        if name.casefold() == "gstreamer_python":
+            continue
         try:
-            if name.casefold() == "gstreamer_python":
-                continue
             dist = importlib.metadata.distribution(name)
         except importlib.metadata.PackageNotFoundError:
             raise RuntimeError(f"Bundled Python distribution metadata is missing: {name}") from None
-        canonical = dist.metadata["Name"].casefold()
-        license_name = PYTHON_LICENSES.get(canonical)
-        if not license_name:
-            raise RuntimeError(f"No reviewed license mapping for bundled Python package {dist.metadata['Name']}")
-        destination = licenses_root / f"{dist.metadata['Name']}-{dist.version}"
-        destination.mkdir(parents=True, exist_ok=True)
-        copied: list[str] = []
-        for item in dist.files or ():
-            leaf = Path(str(item)).name.casefold()
-            if not (leaf.startswith(("license", "copying", "notice"))):
-                continue
-            source = Path(dist.locate_file(item))
-            if source.is_file():
-                target = destination / Path(str(item)).name
-                shutil.copy2(source, target)
-                copied.append(str(target.relative_to(root)).replace("\\", "/"))
-        for fallback in LICENSE_FALLBACKS.get(canonical, []):
-            source = root / "licenses" / "common" / fallback
-            if source.is_file():
-                target = destination / fallback
-                shutil.copy2(source, target)
-                copied.append(str(target.relative_to(root)).replace("\\", "/"))
-        if not copied:
-            raise RuntimeError(f"No license text found for bundled Python package {dist.metadata['Name']} {dist.version}")
-        url = PYTHON_URLS.get(canonical) or dist.metadata.get("Home-page")
-        if not url:
-            url = next((v.split(", ", 1)[1] for k, v in dist.metadata.items() if k == "Project-URL" and v.startswith(("Source", "Repository"))), "")
-        if not url:
-            raise RuntimeError(f"No source URL recorded for bundled Python package {dist.metadata['Name']}")
-        records.append((dist.metadata["Name"], dist.version, license_name, copied, url))
+        if dist.metadata["Name"].casefold() in {"setuptools", "wheel", "pyinstaller"}:
+            raise RuntimeError(f"Build-only distribution was collected into the runtime: {dist.metadata['Name']}")
+        records.append(_package_record(root, output_root, dist))
 
-    # setuptools embeds these distributions inside its own namespace. Keep each
-    # package's own version, source link, license expression, and text visible.
-    from PyInstaller.archive.readers import ZlibArchiveReader
-
-    archive = ZlibArchiveReader(str(root / "build" / "LiveRelay" / "PYZ-00.pyz"))
-    vendor_roots = {str(name).split(".")[2] for name in archive.toc if str(name).startswith("setuptools._vendor.")}
-    vendor_info = {
-        "backports": [("backports.tarfile", "MIT", "https://github.com/aresch/backports.tarfile")],
-        "jaraco": [
-            ("jaraco.context", "MIT", "https://github.com/jaraco/jaraco.context"),
-            ("jaraco.functools", "MIT", "https://github.com/jaraco/jaraco.functools"),
-            ("jaraco.text", "MIT", "https://github.com/jaraco/jaraco.text"),
-        ],
-        "more_itertools": [("more-itertools", "MIT", "https://github.com/more-itertools/more-itertools")],
-        "packaging": [("packaging", "Apache-2.0 OR BSD-2-Clause", "https://github.com/pypa/packaging")],
-        "tomli": [("tomli", "MIT", "https://github.com/hukkin/tomli")],
-        "wheel": [("wheel", "MIT", "https://github.com/pypa/wheel")],
-    }
-    vendor_site = Path(sys.prefix) / "Lib" / "site-packages" / "setuptools" / "_vendor"
-    for module, distributions in vendor_info.items():
-        if module not in vendor_roots:
-            continue
-        for distribution_name, license_name, url in distributions:
-            dist = next(iter(importlib.metadata.Distribution.discover(path=[str(vendor_site)], name=distribution_name)), None)
-            if dist is None:
-                raise RuntimeError(f"Vendored setuptools distribution metadata is missing: {distribution_name}")
-            destination = licenses_root / f"{dist.metadata['Name']}-{dist.version}"
-            destination.mkdir(parents=True, exist_ok=True)
-            copied = []
-            for item in dist.files or ():
-                if Path(str(item)).name.casefold().startswith(("license", "copying", "notice")):
-                    source = Path(dist.locate_file(item))
-                    if source.is_file():
-                        target = destination / Path(str(item)).name
-                        shutil.copy2(source, target)
-                        copied.append(str(target.relative_to(root)).replace("\\", "/"))
-            if not copied:
-                raise RuntimeError(f"No license text found for vendored package {dist.metadata['Name']} {dist.version}")
-            records.append((dist.metadata["Name"], dist.version, license_name, copied, url))
-
-    # This wheel carries two additional Python distributions in its data tree;
-    # they are shipped beside, rather than inside, the main environment.
     wheel_site = Path(sys.prefix) / "Lib" / "site-packages" / "gstreamer_python" / "Lib" / "site-packages"
     for name in ("PyGObject", "pycairo"):
         dist = next(iter(importlib.metadata.Distribution.discover(path=[str(wheel_site)], name=name)), None)
         if dist is None:
             raise RuntimeError(f"Bundled Python distribution metadata is missing: {name}")
-        canonical = dist.metadata["Name"].casefold()
-        destination = licenses_root / f"{dist.metadata['Name']}-{dist.version}"
-        destination.mkdir(parents=True, exist_ok=True)
-        copied = []
-        for item in dist.files or ():
-            if Path(str(item)).name.casefold().startswith(("license", "copying", "notice")):
-                source = Path(dist.locate_file(item))
-                if source.is_file():
-                    target = destination / Path(str(item)).name
-                    shutil.copy2(source, target)
-                    copied.append(str(target.relative_to(root)).replace("\\", "/"))
-        for fallback in LICENSE_FALLBACKS.get(canonical, []):
-            source = root / "licenses" / "common" / fallback
-            if source.is_file():
-                target = destination / fallback
-                shutil.copy2(source, target)
-                copied.append(str(target.relative_to(root)).replace("\\", "/"))
-        if not copied:
-            raise RuntimeError(f"No license text found for bundled Python package {dist.metadata['Name']} {dist.version}")
-        license_name = PYTHON_LICENSES[canonical]
-        records.append((dist.metadata["Name"], dist.version, license_name, copied, PYTHON_URLS[canonical]))
-    gst_python_dist = next(
-        iter(importlib.metadata.Distribution.discover(path=[str(Path(sys.prefix) / "Lib" / "site-packages")], name="gstreamer_python")),
-        None,
-    )
-    if gst_python_dist is None:
-        raise RuntimeError("Bundled gstreamer-python wheel metadata is missing")
-    if not gst_python_dist.metadata.get("License"):
-        raise RuntimeError("gstreamer-python wheel license expression is missing")
-    composite_files = [
-        "licenses/common/MPL-1.1.txt",
-        "licenses/common/LGPL-2.1.txt",
-        "licenses/common/BSD-3-Clause.txt",
-        "licenses/common/LGPL-2.0.txt",
-        "licenses/common/MIT.txt",
-    ]
-    for relative in composite_files:
-        if not (root / relative).is_file():
-            raise RuntimeError(f"gstreamer-python declared license text is missing: {relative}")
-    records.append(
-        (
-            "gstreamer-python wheel",
-            gst_python_dist.version,
-            gst_python_dist.metadata["License"],
-            composite_files,
-            f"https://pypi.org/project/gstreamer-python/{gst_python_dist.version}/",
+        fallback = ("MPL-1.1.txt",) if name.casefold() == "pycairo" else ()
+        records.append(_package_record(root, output_root, dist, fallback_names=fallback))
+
+    gst_site = Path(sys.prefix) / "Lib" / "site-packages"
+    gst_python_dist = next(iter(importlib.metadata.Distribution.discover(path=[str(gst_site)], name="gstreamer_python")), None)
+    if gst_python_dist is None or not gst_python_dist.metadata.get("License"):
+        raise RuntimeError("Bundled gstreamer-python wheel metadata or license expression is missing")
+    # Its wheel metadata combines licenses for the shipped bindings and support
+    # files; each underlying package is inventoried separately above.
+    wheel_record = _package_record(
+            root,
+            output_root,
+            gst_python_dist,
+            name="gstreamer-python wheel",
+            license_name=gst_python_dist.metadata["License"],
+            url=f"https://pypi.org/project/gstreamer-python/{gst_python_dist.version}/",
+            fallback_names=("LGPL-2.0.txt",),
         )
-    )
+    wheel_license_files = list(wheel_record[3])
+    for package in ("certifi", "pycountry", "idna", "attrs", "PyGObject", "pycairo"):
+        component = next((record for record in records if record[0].casefold() == package.casefold()), None)
+        if component:
+            wheel_license_files.extend(component[3])
+    records.append((*wheel_record[:3], list(dict.fromkeys(wheel_license_files)), wheel_record[4]))
     return records
 
 
@@ -257,19 +234,18 @@ def _pyz_packages(root: Path) -> set[str]:
 
     pyz = root / "build" / "LiveRelay" / "PYZ-00.pyz"
     archive = ZlibArchiveReader(str(pyz))
-    roots: set[str] = set()
-    for name in archive.toc:
-        if not isinstance(name, str) or name.startswith("__main__"):
-            continue
-        roots.add(name.split(".", 1)[0])
-    packages: set[str] = set()
+    roots = {
+        name.split(".", 1)[0]
+        for name in archive.toc
+        if isinstance(name, str) and not name.startswith("__main__")
+    }
+    if "setuptools" in roots:
+        raise RuntimeError("setuptools is build-only; ensure PyInstaller excludes it from the application archive")
+    package_names = set()
     for module, distributions in importlib.metadata.packages_distributions().items():
         if module in roots:
-            packages.update(distributions or ())
-    packages = {p for p in packages if p.casefold() not in {"liverelay", "twitch-to-ndi"}}
-    # These are loaded by the PyInstaller bootloader/runtime rather than PYZ.
-    packages.add("pyinstaller")
-    return packages
+            package_names.update(distributions or ())
+    return {name for name in package_names if name.casefold() not in {"liverelay", "twitch-to-ndi"}}
 
 
 def _private_gst_env(runtime: Path, root: Path) -> dict[str, str]:
@@ -293,83 +269,96 @@ def _inspect_plugins(root: Path, output_root: Path) -> list[tuple[str, str, str,
     inspect = runtime / "bin" / "gst-inspect-1.0.exe"
     if not inspect.is_file():
         raise RuntimeError(f"Bundled gst-inspect tool is missing: {inspect}")
-    result_records = []
+    records = []
     env = _private_gst_env(runtime, root)
     for plugin in manifest["plugins"]:
         result = subprocess.run([str(inspect), plugin], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
-        text = result.stdout
-        match = re.search(r"Plugin Details:\s*\n\s*Name\s+([^\n]+)\n\s*Description\s+([^\n]*)\n\s*Filename\s+([^\n]+)\n\s*Version\s+([^\n]+)\n\s*License\s+([^\n]+)", text)
+        match = re.search(r"Plugin Details:\s*\n\s*Name\s+([^\n]+)\n\s*Description\s+([^\n]*)\n\s*Filename\s+([^\n]+)\n\s*Version\s+([^\n]+)\n\s*License\s+([^\n]+)", result.stdout)
         if not match:
             raise RuntimeError(f"Unable to parse gst-inspect metadata for plugin {plugin}")
         name, _description, filename, version, license_id = (part.strip() for part in match.groups())
         if re.search(r"\b(?:AGPL|GPL)(?:v?\d(?:\.\d)?)?(?:\+|-\w+)?\b", license_id, re.IGNORECASE):
             raise RuntimeError(f"Forbidden GPL-family GStreamer plugin detected: {plugin} ({license_id})")
-        if name != plugin:
-            raise RuntimeError(f"Plugin identity mismatch: expected {plugin}, gst-inspect reports {name}")
-        if not Path(filename).resolve().is_file():
-            raise RuntimeError(f"Plugin binary is missing: {filename}")
-        if not Path(filename).resolve().is_relative_to(runtime.resolve()):
-            raise RuntimeError(f"Plugin resolves outside the bundled private runtime: {filename}")
+        if name != plugin or not Path(filename).resolve().is_file() or not Path(filename).resolve().is_relative_to(runtime.resolve()):
+            raise RuntimeError(f"Plugin {plugin} did not resolve to its bundled binary: {filename}")
         source = GST_SOURCES.get(plugin)
         if source is None:
             raise RuntimeError(f"No source-module mapping for GStreamer plugin {plugin}")
-        expected_license = "MPL-2.0" if plugin == "ndi" else "LGPL-2.1-or-later"
-        if plugin == "ndi" and not license_id.casefold().startswith("mpl"):
-            raise RuntimeError(f"Unexpected gst-plugin-ndi license: {license_id}")
-        if plugin != "ndi" and "lgpl" not in license_id.casefold():
+        license_name = "MPL-2.0" if plugin == "ndi" else "LGPL-2.1-or-later"
+        if (plugin == "ndi" and not license_id.casefold().startswith("mpl")) or (plugin != "ndi" and "lgpl" not in license_id.casefold()):
             raise RuntimeError(f"Unexpected GStreamer plugin license: {plugin}: {license_id}")
-        result_records.append((plugin, version, expected_license, source, filename))
-    return result_records
+        records.append((plugin, version, license_name, source, filename))
+    return records
 
 
-def _copy_python_runtime_licenses(root: Path, output_root: Path) -> list[str]:
+def _record_license_path(records: list[tuple[str, str, str, list[str], str]], package: str) -> str:
+    record = next((item for item in records if item[0].casefold() == package.casefold()), None)
+    if record is None or not record[3]:
+        raise RuntimeError(f"No extracted license text available for {package}")
+    return record[3][0]
+
+
+def _copy_runtime_licenses(
+    root: Path,
+    output_root: Path,
+    package_records: list[tuple[str, str, str, list[str], str]],
+) -> list[str]:
     python_root = Path(sys.base_prefix)
-    copied: list[str] = []
-    destination = root / "licenses" / "runtime"
+    destination = output_root / "licenses" / "runtime"
     destination.mkdir(parents=True, exist_ok=True)
-    sources = [
+    copies = [
         (python_root / "LICENSE.txt", destination / "Python-PSF-2.0.txt"),
         (python_root / "tcl" / "tk8.6" / "license.terms", destination / "Tcl-Tk-license.terms"),
+        (root / "packaging" / "licenses" / "LGPL-2.0.txt", destination / "LGPL-2.0.txt"),
+        (root / "packaging" / "licenses" / "libffi-LICENSE.txt", destination / "libffi-LICENSE.txt"),
     ]
-    for source, target in sources:
-        if source.is_file():
-            shutil.copy2(source, target)
-            copied.append(str(target.relative_to(root)).replace("\\", "/"))
-    bundled_names = {p.name.casefold() for p in output_root.rglob("*.dll")}
-    required = {"python314.dll": "Python-PSF-2.0.txt", "tk86t.dll": "Tcl-Tk-license.terms", "tcl86t.dll": "Tcl-Tk-license.terms"}
+    copies.extend(
+        [
+            (output_root / _record_license_path(package_records, "pycountry"), destination / "GStreamer-LGPL-2.1.txt"),
+            (output_root / _record_license_path(package_records, "certifi"), destination / "GStreamer-NDI-MPL-2.0.txt"),
+        ]
+    )
+    for source, target in copies:
+        if not source.is_file():
+            raise RuntimeError(f"License source for bundled native runtime is missing: {source}")
+        shutil.copy2(source, target)
+    bundled_names = {path.name.casefold() for path in output_root.rglob("*.dll")}
+    required = {
+        "python314.dll": "Python-PSF-2.0.txt",
+        "tk86t.dll": "Tcl-Tk-license.terms",
+        "tcl86t.dll": "Tcl-Tk-license.terms",
+    }
     for filename, license_filename in required.items():
-        if filename in bundled_names and not any(Path(p).name == license_filename for p in copied):
+        if filename in bundled_names and not (destination / license_filename).is_file():
             raise RuntimeError(f"License text for bundled native component {filename} is missing")
-    common = root / "licenses" / "common"
-    common.mkdir(parents=True, exist_ok=True)
-    lgpl = common / "LGPL-2.1.txt"
-    if lgpl.is_file():
-        shutil.copy2(lgpl, destination / "GStreamer-LGPL-2.1.txt")
-        copied.append("licenses/runtime/GStreamer-LGPL-2.1.txt")
-    mpl = common / "MPL-2.0.txt"
-    if mpl.is_file():
-        shutil.copy2(mpl, destination / "GStreamer-NDI-MPL-2.0.txt")
-        copied.append("licenses/runtime/GStreamer-NDI-MPL-2.0.txt")
-    return copied
+    return [str(target.relative_to(output_root)).replace("\\", "/") for _, target in copies]
 
 
 def generate(root: Path, output_root: Path) -> None:
-    packages = _pyz_packages(root)
-    python_records = _write_package_licenses(root, packages)
+    package_records = _write_package_licenses(root, output_root, _pyz_packages(root))
     gst_records = _inspect_plugins(root, output_root)
-    runtime_license_files = _copy_python_runtime_licenses(root, output_root)
+    runtime_license_files = _copy_runtime_licenses(root, output_root, package_records)
+    licenses_root = output_root / "licenses"
+    for filename, description in PACKAGED_LICENSE_RESOURCES.items():
+        source = root / "packaging" / "licenses" / filename
+        if not source.is_file():
+            raise RuntimeError(f"Required fixed license resource is missing: {source} ({description})")
+        target = licenses_root / "runtime" / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
     lines = [
         "LiveRelay Third-Party Notices",
         "==============================",
         "",
         "LiveRelay application code is licensed under MIT; see LICENSE.",
-        "This inventory is generated from Python modules and GStreamer plugins in the built onedir artifact.",
+        "This inventory covers components included in this onedir distribution.",
         "Bundled third-party components retain their respective licenses.",
         "",
-        "Python distributions",
-        "--------------------",
+        "Python runtime dependencies",
+        "----------------------------",
     ]
-    for name, version, license_name, license_files, url in sorted(python_records, key=lambda record: record[0].casefold()):
+    for name, version, license_name, license_files, url in sorted(package_records, key=lambda record: record[0].casefold()):
         lines.extend([f"- {name} {version} — {license_name}", f"  Source: {url}"])
         lines.extend(f"  License text: {item}" for item in license_files)
     lines.extend(["", "GStreamer plugins (queried using the bundled gst-inspect-1.0)", "-------------------------------------------------------------"])
@@ -385,91 +374,70 @@ def generate(root: Path, output_root: Path) -> None:
     lines.extend(["", "GStreamer runtime libraries", "----------------------------"])
     gstreamer_bin = output_root / "runtime" / "gstreamer" / "bin"
     gst_native = {
-        "ffi-7.dll": ("libffi", "3.2.9999.5", "MIT", "https://gitlab.freedesktop.org/gstreamer/meson-ports/libffi"),
-        "gio-2.0-0.dll": ("GLib", "2.82.4", "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib"),
-        "girepository-1.0-1.dll": ("GLib", "2.82.4", "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib"),
-        "glib-2.0-0.dll": ("GLib", "2.82.4", "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib"),
-        "gmodule-2.0-0.dll": ("GLib", "2.82.4", "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib"),
-        "gobject-2.0-0.dll": ("GLib", "2.82.4", "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib"),
-        "intl-8.dll": ("proxy-libintl", "0.5", "LGPL-2.1-or-later", "https://github.com/frida/proxy-libintl"),
-        "orc-0.4-0.dll": ("ORC", "0.4.42", "BSD-2-Clause AND BSD-3-Clause", "https://github.com/GStreamer/orc/tree/orc-0.4.42"),
-        "pcre2-8-0.dll": ("PCRE2", "10.42", "BSD-3-Clause", "https://github.com/PCRE2Project/pcre2"),
-        "z-1.dll": ("zlib", "1.3.1", "Zlib", "https://zlib.net/"),
+        "ffi-7.dll": ("libffi", "3.2.9999.5", "MIT", "https://gitlab.freedesktop.org/gstreamer/meson-ports/libffi", "libffi-LICENSE.txt"),
+        "gio-2.0-0.dll": ("GLib", "2.82.4", "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib", ""),
+        "girepository-1.0-1.dll": ("GLib", "2.82.4", "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib", ""),
+        "glib-2.0-0.dll": ("GLib", "2.82.4", "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib", ""),
+        "gmodule-2.0-0.dll": ("GLib", "2.82.4", "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib", ""),
+        "gobject-2.0-0.dll": ("GLib", "2.82.4", "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib", ""),
+        "intl-8.dll": ("proxy-libintl", "0.5", "LGPL-2.1-or-later", "https://github.com/frida/proxy-libintl", ""),
+        "orc-0.4-0.dll": ("ORC", "0.4.42", "BSD-2-Clause AND BSD-3-Clause", "https://github.com/GStreamer/orc/tree/orc-0.4.42", "ORC-COPYING.txt"),
+        "pcre2-8-0.dll": ("PCRE2", "10.42", "BSD-3-Clause", "https://github.com/PCRE2Project/pcre2", "PCRE2-LICENCE.txt"),
+        "z-1.dll": ("zlib", "1.3.1", "Zlib", "https://zlib.net/", "zlib-LICENSE.txt"),
     }
     for filename in sorted(gstreamer_bin.glob("*.dll")):
         if filename.name in gst_native:
-            name, version, license_name, url = gst_native[filename.name]
-            license_files = {
-                "ffi-7.dll": "licenses/common/libffi-MIT.txt",
-                "intl-8.dll": "licenses/runtime/GStreamer-LGPL-2.1.txt",
-                "orc-0.4-0.dll": "licenses/common/ORC-COPYING.txt",
-                "pcre2-8-0.dll": "licenses/common/PCRE2-BSD-3-Clause.txt",
-                "z-1.dll": "licenses/common/zlib-Zlib.txt",
-            }
+            name, version, license_name, url, license_file = gst_native[filename.name]
             lines.append(f"- {filename.name} — {name} {version}, {license_name}; {url}")
-            lines.append(f"  License text: {license_files.get(filename.name, 'licenses/runtime/GStreamer-LGPL-2.1.txt')}")
+            if license_file:
+                lines.append(f"  License text: licenses/runtime/{license_file}")
         else:
             lines.append(f"- {filename.name} — GStreamer {gst_version}, LGPL-2.1-or-later; https://gstreamer.freedesktop.org/src/")
     lines.extend(
         [
-            "  License text: licenses/runtime/GStreamer-LGPL-2.1.txt",
-            "  NDI plugin license text: licenses/runtime/GStreamer-NDI-MPL-2.0.txt",
+            "  GStreamer LGPL text: licenses/runtime/GStreamer-LGPL-2.1.txt",
+            "  NDI plugin MPL text: licenses/runtime/GStreamer-NDI-MPL-2.0.txt",
             "  Separate DLLs are replaceable; no GStreamer libraries are statically linked.",
         ]
     )
-    lines.extend(["", "Native runtimes", "---------------"])
-    dll_names = {p.name.casefold() for p in output_root.rglob("*.dll")}
+    lines.extend(["", "Native runtime libraries", "-------------------------"])
+    dll_names = {path.name.casefold() for path in output_root.rglob("*.dll")}
     for name, version, license_name, url, files, license_key in NATIVE_COMPONENTS:
-        present = [f for f in files if f.casefold() in dll_names]
-        if license_key == "gstreamer":
-            present = ["runtime/gstreamer/bin/*.dll"]
+        present = [filename for filename in files if filename.casefold() in dll_names]
         if present:
             lines.extend([f"- {name} {version} — {license_name}", f"  Source/terms: {url}", f"  Files: {', '.join(present)}"])
-            if license_key == "openssl":
-                lines.append("  License text: licenses/common/OpenSSL-Apache-2.0.txt")
+            if license_key == "python":
+                lines.append("  License text: licenses/runtime/Python-PSF-2.0.txt")
+            elif license_key == "openssl":
+                lines.append(f"  License text: {_record_license_path(package_records, 'requests')}")
             elif license_key == "libffi":
-                lines.append("  License text: licenses/common/libffi-MIT.txt")
+                lines.append("  License text: licenses/runtime/libffi-LICENSE.txt")
             elif license_key == "zlib":
-                lines.append("  License text: licenses/common/zlib-Zlib.txt")
-    if runtime_license_files:
-        lines.extend(["", "Runtime license texts", "---------------------"])
-        lines.extend(f"- {item}" for item in runtime_license_files)
+                lines.append("  License text: licenses/runtime/zlib-LICENSE.txt")
+            elif license_key == "tcltk":
+                lines.append("  License text: licenses/runtime/Tcl-Tk-license.terms")
+    if "vcruntime140.dll" in dll_names:
+        lines.extend(["", "Microsoft Visual C++ runtime redistribution is subject to the linked Microsoft software license terms."])
+    lines.extend(["", "Runtime license texts", "---------------------"])
+    lines.extend(f"- {item}" for item in runtime_license_files)
     lines.extend(
         [
             "",
-            "Windows system libraries",
-            "-------------------------",
-            "Windows API Set forwarders and ucrtbase.dll are operating-system components. They are not intended to be app-local; the build removes copies that PyInstaller discovers in Windows SDK/tool directories. Windows supplies the applicable system components.",
-        ]
-    )
-    lines.extend(
-        [
+            "NDI attribution",
+            "----------------",
+            "NDI® is a registered trademark of Vizrt NDI AB. NDI Runtime is not included; LiveRelay uses the installed runtime selected by NDI_RUNTIME_DIR_V6. See https://ndi.video/ and the NDI SDK/runtime terms.",
             "",
-            "NDI",
-            "---",
-            "The NDI® trademark is owned by Vizrt NDI AB. NDI Runtime is not included in this package; the application uses an existing NDI Runtime selected by NDI_RUNTIME_DIR_V6. See https://ndi.video/ and the NDI SDK/runtime terms for the installed runtime.",
-            "",
-            "LGPL replacement and relinking information",
-            "------------------------------------------",
-            "The GStreamer LGPL libraries and plugins are distributed as separate replaceable DLL files under runtime/gstreamer. Python bytecode/application modules are not statically linked into those libraries. A recipient may replace those DLLs with compatible modified versions; rebuild the private runtime from corresponding source modules and preserve the same directory layout.",
-            "",
-            "PyInstaller",
-            "-----------",
-            "PyInstaller is used to construct this executable and its bootloader. Its GPL license includes the PyInstaller exception permitting distribution of the generated application under its own license.",
+            "LGPL replacement information",
+            "----------------------------",
+            "The GStreamer LGPL libraries and plugins are separate replaceable DLL files under runtime/gstreamer. A recipient can replace these DLLs with compatible modified builds; corresponding source modules are linked above. No GStreamer libraries are statically linked.",
             "",
         ]
     )
-    notice = "\n".join(lines)
-    notice_path = root / "THIRD_PARTY_NOTICES.txt"
-    notice_path.write_text(notice, encoding="utf-8", newline="\n")
-    bundle_licenses = output_root / "licenses"
-    shutil.copytree(root / "licenses", bundle_licenses, dirs_exist_ok=True)
+    notice_path = output_root / "THIRD_PARTY_NOTICES.txt"
+    notice_path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
     shutil.copy2(root / "LICENSE", output_root / "LICENSE")
-    shutil.copy2(notice_path, output_root / "THIRD_PARTY_NOTICES.txt")
-    if not (root / "licenses").is_dir() or not any((root / "licenses").rglob("*")):
-        raise RuntimeError("License text directory is empty")
     print(f"Generated third-party inventory: {notice_path}")
-    print(f"Inventoried {len(python_records)} Python distributions and {len(gst_records)} GStreamer plugins.")
+    print(f"Inventoried {len(package_records)} Python runtime distributions and {len(gst_records)} GStreamer plugins.")
 
 
 if __name__ == "__main__":
