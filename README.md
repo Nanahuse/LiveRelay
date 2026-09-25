@@ -55,6 +55,15 @@ including the required NDI attribution and license coverage.
 
 NDI® is a registered trademark of Vizrt NDI AB. See [ndi.video](https://ndi.video/).
 
+## License
+
+LiveRelay itself is licensed under the MIT License. Third-party components
+distributed with LiveRelay remain under their respective licenses. See
+`THIRD_PARTY_NOTICES.txt` and `licenses/` for details. The onedir build bundles
+LGPL libraries in replaceable files under `runtime/gstreamer`; those files can
+be replaced with modified compatible builds. NDI Runtime remains an installed
+machine dependency and is not included in the bundle.
+
 ## Build the Windows onedir application
 
 Build on Windows with Python 3.14. The private GStreamer runtime and the
