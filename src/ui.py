@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import tkinter as tk
-import webbrowser
 
 from controller import SingleStreamController
 
@@ -22,8 +21,8 @@ class RelayWindow:
         root.minsize(620, 450)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.url_var = tk.StringVar(value="https://www.twitch.tv/")
-        self.ndi_var = tk.StringVar(value="Twitch NDI")
+        self.url_var = tk.StringVar(value="")
+        self.ndi_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Status: Stopped")
         self.quality_var = tk.StringVar(value="-")
         self.video_var = tk.StringVar(value="-")
@@ -38,22 +37,14 @@ class RelayWindow:
         body = tk.Frame(root, padx=16, pady=12)
         body.pack(fill="both", expand=True)
 
-        tk.Label(body, text="Twitch URL").grid(row=0, column=0, sticky="w", pady=(0, 3))
+        tk.Label(body, text="Stream URL").grid(row=0, column=0, sticky="w", pady=(0, 3))
         self.url_entry = tk.Entry(body, textvariable=self.url_var, width=72)
         self.url_entry.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(0, 9))
 
-        tk.Label(body, text="NDI® Source Name").grid(row=2, column=0, sticky="w", pady=(0, 3))
-        ndi_attribution = tk.Label(
-            body,
-            text="NDI® is a registered trademark of Vizrt NDI AB · ndi.video",
-            anchor="e",
-            cursor="hand2",
-            fg="#0759a5",
-        )
-        ndi_attribution.grid(row=2, column=1, columnspan=3, sticky="e", pady=(0, 3))
-        ndi_attribution.bind("<Button-1>", lambda _event: webbrowser.open("https://ndi.video/"))
+        tk.Label(body, text="NDI Source Name").grid(row=2, column=0, sticky="w", pady=(0, 3))
         self.ndi_entry = tk.Entry(body, textvariable=self.ndi_var, width=48)
         self.ndi_entry.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 9))
+
         self.start_button = tk.Button(body, text="Start", width=12, command=self.on_start)
         self.start_button.grid(row=3, column=3, sticky="e", padx=(12, 0), pady=(0, 9))
 

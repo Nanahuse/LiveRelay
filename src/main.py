@@ -21,6 +21,7 @@ from typing import Any
 
 from streamlink import Streamlink
 from streamlink.exceptions import StreamlinkError
+from stream_source import resolve_stream
 
 
 MAX_DELAY_MS = 30_000
@@ -123,7 +124,7 @@ def build_pipeline(
     initial_delay_ms: int = INITIAL_DELAY_MS,
     on_media_info: Any = None,
 ) -> tuple[Any, dict[str, Any]]:
-    pipeline = Gst.Pipeline.new("twitch-to-ndi")
+    pipeline = Gst.Pipeline.new("liverelay")
     if pipeline is None:
         raise RuntimeError("Could not create GStreamer pipeline")
 
@@ -574,21 +575,21 @@ def console_input(commands: queue.Queue[tuple[str, Any]], stop: threading.Event)
             print("Commands: delay <0..30000>, status, quit", flush=True)
 
 
-def run(url: str, ndi_name: str) -> int:
+def run(url: str, ndi_name: str = "") -> int:
     stream_io = None
     runtime: Runtime | None = None
     stop = threading.Event()
     pump_thread: threading.Thread | None = None
     console_thread: threading.Thread | None = None
     try:
+        url = url.strip()
+        session = Streamlink()
+        provider, plugin, _resolved_url, ndi_name = resolve_stream(session, url, ndi_name)
         Gst, GLib = load_gst()
         Gst.init(None)
-        session = Streamlink()
-        _, plugin_class, resolved_url = session.resolve_url(url)
-        plugin = plugin_class(session, resolved_url, options={"low-latency": True})
         streams = plugin.streams()
         if not streams:
-            raise ValueError("Twitch returned no streams (the channel may be offline)")
+            raise ValueError(f"No live stream is available for this {provider.title()} URL.")
         print("Available streams:")
         print(", ".join(streams))
         selected_name, selected_stream = select_stream(plugin, streams)
@@ -654,10 +655,10 @@ def _check_pump_error(runtime: Runtime, errors: queue.Queue[BaseException]) -> b
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="LiveRelay")
-    parser.add_argument("url", help="Twitch channel URL")
-    parser.add_argument("--ndi-name", required=True, help="NDI source name")
+    parser.add_argument("url", help="Live stream URL")
+    parser.add_argument("--ndi-name", help="NDI source name (required for YouTube)")
     args = parser.parse_args()
-    raise SystemExit(run(args.url, args.ndi_name))
+    raise SystemExit(run(args.url, args.ndi_name or ""))
 
 
 if __name__ == "__main__":

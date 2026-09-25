@@ -43,10 +43,8 @@ def main() -> int:
         "--cli-url",
         help="Run a stream directly through the private runtime instead of opening the UI.",
     )
-    parser.add_argument("--ndi-name", help="NDI source name for --cli-url.")
+    parser.add_argument("--ndi-name", help="NDI source name (required for YouTube).")
     args = parser.parse_args()
-    if bool(args.cli_url) != bool(args.ndi_name):
-        parser.error("--cli-url and --ndi-name must be provided together")
     if args.check_only and args.cli_url:
         parser.error("--check-only cannot be combined with --cli-url")
 
@@ -111,7 +109,7 @@ def main() -> int:
     if args.cli_url:
         from main import run as run_cli
 
-        return run_cli(args.cli_url, args.ndi_name)
+        return run_cli(args.cli_url, args.ndi_name or "")
 
     from ui import main as ui_main
 
