@@ -268,6 +268,7 @@ class SingleStreamController:
         finally:
             self._stop_event.set()
             if runtime is not None:
+                runtime.close()
                 runtime.pipeline.set_state(runtime.Gst.State.NULL)
             if stream_io is not None:
                 try:

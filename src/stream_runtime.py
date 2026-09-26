@@ -259,7 +259,15 @@ class DelayController:
         self.elements = elements
         self.delay_ms = initial_delay_ms
         self.adjustment: Adjustment | None = None
+        self._poll_id: int | None = None
         self._lock = threading.RLock()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._poll_id is not None:
+                self.GLib.source_remove(self._poll_id)
+                self._poll_id = None
+            self.adjustment = None
 
     @staticmethod
     def _validate(delay_ms: int) -> int:
@@ -301,12 +309,13 @@ class DelayController:
                 f"Audio queue: {audio_level / 1e6:.0f}ms -> pending",
                 flush=True,
             )
-            self.GLib.timeout_add(QUEUE_POLL_INTERVAL_MS, self._poll_decrease)
+            self._poll_id = self.GLib.timeout_add(QUEUE_POLL_INTERVAL_MS, self._poll_decrease)
 
     def _poll_decrease(self) -> bool:
         with self._lock:
             adjustment = self.adjustment
             if adjustment is None:
+                self._poll_id = None
                 return False
             video = self.elements["video_delay_queue"]
             audio = self.elements["audio_delay_queue"]
@@ -330,6 +339,7 @@ class DelayController:
             if video_done and audio_done:
                 self.elements["output_valve"].set_property("drop", False)
                 self.adjustment = None
+                self._poll_id = None
                 print("Delay adjustment complete", flush=True)
                 return False
             if report_progress:
@@ -372,12 +382,27 @@ class Runtime:
         self.notify = notify
         self._diagnostic_started_at = time.monotonic()
         self._last_diagnostic_at = 0.0
-        bus = pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self._on_bus_message)
-        GLib.timeout_add(25, self._drain_commands)
+        self._bus = pipeline.get_bus()
+        self._bus.add_signal_watch()
+        self._bus_handler = self._bus.connect("message", self._on_bus_message)
+        self._command_id = GLib.timeout_add(25, self._drain_commands)
+        self._snapshot_id = None
         if self.notify is not None or DIAGNOSTICS_ENABLED:
-            GLib.timeout_add(200, self._publish_snapshot)
+            self._snapshot_id = GLib.timeout_add(200, self._publish_snapshot)
+
+    def close(self) -> None:
+        """Detach sources from the shared GLib context before another stream starts."""
+        self.notify = None
+        for attribute in ("_command_id", "_snapshot_id"):
+            source_id = getattr(self, attribute)
+            if source_id is not None:
+                self.GLib.source_remove(source_id)
+                setattr(self, attribute, None)
+        self.controller.close()
+        if self._bus_handler is not None:
+            self._bus.disconnect(self._bus_handler)
+            self._bus.remove_signal_watch()
+            self._bus_handler = None
 
     def _on_bus_message(self, _bus: Any, message: Any) -> None:
         if message.type == self.Gst.MessageType.ERROR:
@@ -431,6 +456,7 @@ class Runtime:
                     self.controller.set_delay_ms(value)
                     print(f"Configured delay: {self.controller.delay_ms} ms", flush=True)
                 elif command == "quit":
+                    self._command_id = None
                     self.loop.quit()
                     return False
             except (RuntimeError, ValueError) as error:

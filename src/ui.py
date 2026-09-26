@@ -15,6 +15,7 @@ class RelayWindow:
         self.root = root
         self.controller = SingleStreamController()
         self._closing = False
+        self._refresh_id: str | None = None
         self._local_error: str | None = None
         self._delay_buttons: list[tuple[tk.Button, int]] = []
 
@@ -141,6 +142,9 @@ class RelayWindow:
         self.refresh_ui()
 
     def refresh_ui(self) -> None:
+        if self._refresh_id is not None:
+            self.root.after_cancel(self._refresh_id)
+            self._refresh_id = None
         if self._closing:
             return
         snapshot = self.controller.snapshot()
@@ -202,12 +206,15 @@ class RelayWindow:
             allowed = controls_ready and 0 <= snapshot.target_delay_ms + amount_ms <= 30_000
             button.config(state="normal" if allowed else "disabled")
 
-        self.root.after(200, self.refresh_ui)
+        self._refresh_id = self.root.after(200, self.refresh_ui)
 
     def on_close(self) -> None:
         if self._closing:
             return
         self._closing = True
+        if self._refresh_id is not None:
+            self.root.after_cancel(self._refresh_id)
+            self._refresh_id = None
         for widget in (self.url_entry, self.ndi_entry, self.minimum_resolution_combo, self.start_button):
             widget.config(state="disabled")
         for button, _amount in self._delay_buttons:

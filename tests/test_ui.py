@@ -37,3 +37,12 @@ class MinimumResolutionUiTests(unittest.TestCase):
                 self.window.refresh_ui()
                 expected = "readonly" if state in ("stopped", "error") else "disabled"
                 self.assertEqual(str(self.window.minimum_resolution_combo["state"]), expected)
+
+    def test_delay_clicks_keep_one_refresh_timer(self) -> None:
+        for _ in range(5):
+            self.window.on_delay(100)
+        self.assertEqual(self.window.delay_var.get(), "0.5 s")
+        self.assertEqual(len(self.root.tk.call("after", "info")), 1)
+        with patch.object(self.root, "destroy"):
+            self.window.on_close()
+        self.assertEqual(len(self.root.tk.call("after", "info")), 0)
