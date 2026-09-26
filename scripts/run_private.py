@@ -39,14 +39,7 @@ def main() -> int:
         "--check-only", action="store_true",
         help="Verify isolated GStreamer and NDI runtime loading without opening the UI.",
     )
-    parser.add_argument(
-        "--cli-url",
-        help="Run a stream directly through the private runtime instead of opening the UI.",
-    )
-    parser.add_argument("--ndi-name", help="NDI source name (required for YouTube).")
     args = parser.parse_args()
-    if args.check_only and args.cli_url:
-        parser.error("--check-only cannot be combined with --cli-url")
 
     root = workspace_root()
     if getattr(sys, "frozen", False):
@@ -59,7 +52,7 @@ def main() -> int:
     sys.path.insert(0, str(root / "src"))
     gst_root, ndi_root = configure_private_environment(root)
 
-    from main import load_gst
+    from stream_runtime import load_gst
 
     Gst, _GLib = load_gst()
     Gst.init(None)
@@ -105,11 +98,6 @@ def main() -> int:
     if args.check_only:
         print("Private GStreamer and environment NDI Runtime checks passed.")
         return 0
-
-    if args.cli_url:
-        from main import run as run_cli
-
-        return run_cli(args.cli_url, args.ndi_name or "")
 
     from ui import main as ui_main
 

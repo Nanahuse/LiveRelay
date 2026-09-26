@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import tkinter as tk
+from tkinter import ttk
 
 from controller import SingleStreamController
 
 
 DELAY_STEPS_MS = (5000, 1000, 500, 100)
+MINIMUM_RESOLUTIONS = ("144p", "240p", "360p", "480p", "720p", "1080p")
 
 
 class RelayWindow:
@@ -13,16 +15,18 @@ class RelayWindow:
         self.root = root
         self.controller = SingleStreamController()
         self._closing = False
+        self._refresh_id: str | None = None
         self._local_error: str | None = None
         self._delay_buttons: list[tuple[tk.Button, int]] = []
 
         root.title("LiveRelay")
-        root.geometry("660x500")
-        root.minsize(620, 450)
+        root.geometry("660x560")
+        root.minsize(620, 510)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.url_var = tk.StringVar(value="")
         self.ndi_var = tk.StringVar(value="")
+        self.minimum_resolution_var = tk.StringVar(value="480p")
         self.status_var = tk.StringVar(value="Status: Stopped")
         self.quality_var = tk.StringVar(value="-")
         self.video_var = tk.StringVar(value="-")
@@ -48,19 +52,26 @@ class RelayWindow:
         self.start_button = tk.Button(body, text="Start", width=12, command=self.on_start)
         self.start_button.grid(row=3, column=3, sticky="e", padx=(12, 0), pady=(0, 9))
 
+        tk.Label(body, text="Minimum Resolution").grid(row=4, column=0, sticky="w", pady=(0, 3))
+        self.minimum_resolution_combo = ttk.Combobox(
+            body, textvariable=self.minimum_resolution_var,
+            values=MINIMUM_RESOLUTIONS, state="readonly", width=12,
+        )
+        self.minimum_resolution_combo.grid(row=5, column=0, sticky="w", pady=(0, 9))
+
         self.status_label = tk.Label(body, textvariable=self.status_var, anchor="w")
-        self.status_label.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(2, 8))
+        self.status_label.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(2, 8))
 
         info = tk.Frame(body)
-        info.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(0, 12))
+        info.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(0, 12))
         self._info_row(info, 0, "Quality", self.quality_var)
         self._info_row(info, 1, "Video", self.video_var)
         self._info_row(info, 2, "Audio", self.audio_var)
         self._info_row(info, 3, "NDI", self.ndi_info_var)
 
-        tk.Label(body, text="Delay").grid(row=6, column=0, sticky="w", pady=(0, 6))
+        tk.Label(body, text="Delay").grid(row=8, column=0, sticky="w", pady=(0, 6))
         delay_row = tk.Frame(body)
-        delay_row.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(0, 10))
+        delay_row.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(0, 10))
         for step_ms in DELAY_STEPS_MS:
             seconds = step_ms / 1000
             button = tk.Button(
@@ -85,16 +96,16 @@ class RelayWindow:
             self._delay_buttons.append((button, step_ms))
 
         self.adjusting_label = tk.Label(body, textvariable=self.adjusting_var, anchor="w")
-        self.adjusting_label.grid(row=8, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        self.adjusting_label.grid(row=10, column=0, columnspan=4, sticky="w", pady=(0, 4))
         buffers = tk.Frame(body)
-        buffers.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(0, 8))
+        buffers.grid(row=11, column=0, columnspan=4, sticky="ew", pady=(0, 8))
         tk.Label(buffers, text="Video buffer", width=16, anchor="w").grid(row=0, column=0, sticky="w")
         tk.Label(buffers, textvariable=self.video_buffer_var, anchor="w").grid(row=0, column=1, sticky="w")
         tk.Label(buffers, text="Audio buffer", width=16, anchor="w").grid(row=1, column=0, sticky="w")
         tk.Label(buffers, textvariable=self.audio_buffer_var, anchor="w").grid(row=1, column=1, sticky="w")
 
         self.error_label = tk.Label(body, textvariable=self.error_var, anchor="w", justify="left", wraplength=620)
-        self.error_label.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        self.error_label.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(4, 0))
 
         body.grid_columnconfigure(0, weight=1)
         body.grid_columnconfigure(1, weight=1)
@@ -110,7 +121,9 @@ class RelayWindow:
     def on_start(self) -> None:
         self._local_error = None
         try:
-            self.controller.start(self.url_var.get(), self.ndi_var.get())
+            self.controller.start(
+                self.url_var.get(), self.ndi_var.get(), self.minimum_resolution_var.get(),
+            )
         except (RuntimeError, ValueError) as error:
             self._local_error = str(error)
         self.refresh_ui()
@@ -129,6 +142,9 @@ class RelayWindow:
         self.refresh_ui()
 
     def refresh_ui(self) -> None:
+        if self._refresh_id is not None:
+            self.root.after_cancel(self._refresh_id)
+            self._refresh_id = None
         if self._closing:
             return
         snapshot = self.controller.snapshot()
@@ -151,6 +167,7 @@ class RelayWindow:
         editable = not active
         self.url_entry.config(state="normal" if editable else "disabled")
         self.ndi_entry.config(state="normal" if editable else "disabled")
+        self.minimum_resolution_combo.config(state="readonly" if editable else "disabled")
 
         if state in ("running", "adjusting"):
             self.start_button.config(text="Stop", state="normal", command=self.on_stop)
@@ -189,13 +206,16 @@ class RelayWindow:
             allowed = controls_ready and 0 <= snapshot.target_delay_ms + amount_ms <= 30_000
             button.config(state="normal" if allowed else "disabled")
 
-        self.root.after(200, self.refresh_ui)
+        self._refresh_id = self.root.after(200, self.refresh_ui)
 
     def on_close(self) -> None:
         if self._closing:
             return
         self._closing = True
-        for widget in (self.url_entry, self.ndi_entry, self.start_button):
+        if self._refresh_id is not None:
+            self.root.after_cancel(self._refresh_id)
+            self._refresh_id = None
+        for widget in (self.url_entry, self.ndi_entry, self.minimum_resolution_combo, self.start_button):
             widget.config(state="disabled")
         for button, _amount in self._delay_buttons:
             button.config(state="disabled")

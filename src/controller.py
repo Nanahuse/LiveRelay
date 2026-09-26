@@ -9,16 +9,15 @@ from typing import Any
 from streamlink import Streamlink
 from streamlink.exceptions import StreamlinkError
 
-from main import (
+from stream_runtime import (
     INITIAL_DELAY_MS,
     MAX_DELAY_MS,
     Runtime,
     build_pipeline,
     load_gst,
     pump_stream,
-    select_stream,
 )
-from stream_source import resolve_stream
+from stream_source import resolve_stream, select_stream
 
 
 @dataclass(frozen=True)
@@ -47,6 +46,7 @@ class SingleStreamController:
         self._state = "stopped"
         self._url = ""
         self._ndi_name = ""
+        self._minimum_resolution = "480p"
         self._quality: str | None = None
         self._width: int | None = None
         self._height: int | None = None
@@ -89,7 +89,9 @@ class SingleStreamController:
                 self._worker is None or not self._worker.is_alive()
             )
 
-    def start(self, stream_url: str, ndi_name: str = "") -> None:
+    def start(
+        self, stream_url: str, ndi_name: str = "", minimum_resolution: str = "480p",
+    ) -> None:
         stream_url = stream_url.strip()
         if not stream_url:
             raise ValueError("Enter a Stream URL.")
@@ -100,6 +102,7 @@ class SingleStreamController:
                 raise RuntimeError("The previous stream is still stopping.")
             self._url = stream_url
             self._ndi_name = ndi_name.strip()
+            self._minimum_resolution = minimum_resolution
             self._quality = None
             self._width = None
             self._height = None
@@ -210,7 +213,7 @@ class SingleStreamController:
             streams = plugin.streams()
             if not streams:
                 raise ValueError(f"No live stream is available for this {provider.title()} URL.")
-            selected_name, selected_stream = select_stream(plugin, streams)
+            selected_name, selected_stream = select_stream(plugin, streams, self._minimum_resolution)
             with self._lock:
                 self._quality = selected_name
                 initial_delay_ms = self._target_delay_ms
@@ -265,6 +268,7 @@ class SingleStreamController:
         finally:
             self._stop_event.set()
             if runtime is not None:
+                runtime.close()
                 runtime.pipeline.set_state(runtime.Gst.State.NULL)
             if stream_io is not None:
                 try:

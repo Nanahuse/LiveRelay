@@ -1,14 +1,5 @@
-# /// script
-# requires-python = ">=3.14"
-# dependencies = [
-#     "streamlink>=7.0",
-#     "PyGObject>=3.50; sys_platform != 'win32'",
-#     "gstreamer-python==1.28.6; sys_platform == 'win32'",
-# ]
-# ///
 from __future__ import annotations
 
-import argparse
 import importlib
 import os
 import queue
@@ -18,10 +9,6 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any
-
-from streamlink import Streamlink
-from streamlink.exceptions import StreamlinkError
-from stream_source import resolve_stream
 
 
 MAX_DELAY_MS = 30_000
@@ -38,19 +25,6 @@ APP_SOURCE_MAX_BYTES = 1024 * 1024
 DIAGNOSTIC_INTERVAL_SECONDS = 0.25
 DIAGNOSTICS_ENABLED = os.environ.get("TWITCH_TO_NDI_DIAGNOSTICS") == "1"
 _DLL_DIRECTORY_HANDLES: list[Any] = []
-
-
-def select_stream(plugin: Any, streams: dict[str, Any]) -> tuple[str, Any]:
-    threshold, _ = plugin.stream_weight("480p")
-    candidates = []
-    for name, stream in streams.items():
-        weight, group = plugin.stream_weight(name)
-        if group == "pixels" and weight >= threshold:
-            candidates.append((weight, name, stream))
-    if not candidates:
-        raise ValueError("No pixel stream at 480p or higher is available")
-    _, name, stream = min(candidates, key=lambda candidate: (candidate[0], candidate[1]))
-    return name, stream
 
 
 def load_gst() -> tuple[Any, Any]:
@@ -285,7 +259,15 @@ class DelayController:
         self.elements = elements
         self.delay_ms = initial_delay_ms
         self.adjustment: Adjustment | None = None
+        self._poll_id: int | None = None
         self._lock = threading.RLock()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._poll_id is not None:
+                self.GLib.source_remove(self._poll_id)
+                self._poll_id = None
+            self.adjustment = None
 
     @staticmethod
     def _validate(delay_ms: int) -> int:
@@ -327,22 +309,13 @@ class DelayController:
                 f"Audio queue: {audio_level / 1e6:.0f}ms -> pending",
                 flush=True,
             )
-            self.GLib.timeout_add(QUEUE_POLL_INTERVAL_MS, self._poll_decrease)
-
-    def increase_delay_ms(self, amount_ms: int) -> None:
-        if amount_ms <= 0:
-            raise ValueError("Delay change amount must be positive")
-        self.set_delay_ms(self.delay_ms + amount_ms)
-
-    def decrease_delay_ms(self, amount_ms: int) -> None:
-        if amount_ms <= 0:
-            raise ValueError("Delay change amount must be positive")
-        self.set_delay_ms(self.delay_ms - amount_ms)
+            self._poll_id = self.GLib.timeout_add(QUEUE_POLL_INTERVAL_MS, self._poll_decrease)
 
     def _poll_decrease(self) -> bool:
         with self._lock:
             adjustment = self.adjustment
             if adjustment is None:
+                self._poll_id = None
                 return False
             video = self.elements["video_delay_queue"]
             audio = self.elements["audio_delay_queue"]
@@ -366,6 +339,7 @@ class DelayController:
             if video_done and audio_done:
                 self.elements["output_valve"].set_property("drop", False)
                 self.adjustment = None
+                self._poll_id = None
                 print("Delay adjustment complete", flush=True)
                 return False
             if report_progress:
@@ -385,20 +359,6 @@ class DelayController:
                     flush=True,
                 )
             return True
-
-    def status(self) -> str:
-        with self._lock:
-            video = self.elements["video_delay_queue"]
-            audio = self.elements["audio_delay_queue"]
-            adjustment = self.adjustment
-            lines = [f"Configured delay: {self.delay_ms} ms", f"Adjusting: {adjustment is not None}"]
-            if adjustment:
-                lines.append(f"Direction: {adjustment.direction}")
-            for label, element in (("Video queue", video), ("Audio queue", audio)):
-                level_ns = int(element.get_property("current-level-time"))
-                level_bytes = int(element.get_property("current-level-bytes"))
-                lines.extend((f"{label}:", f"  time: {level_ns / 1e9:.3f} s", f"  bytes: {level_bytes}"))
-            return "\n".join(lines)
 
 
 class Runtime:
@@ -422,12 +382,27 @@ class Runtime:
         self.notify = notify
         self._diagnostic_started_at = time.monotonic()
         self._last_diagnostic_at = 0.0
-        bus = pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self._on_bus_message)
-        GLib.timeout_add(25, self._drain_commands)
+        self._bus = pipeline.get_bus()
+        self._bus.add_signal_watch()
+        self._bus_handler = self._bus.connect("message", self._on_bus_message)
+        self._command_id = GLib.timeout_add(25, self._drain_commands)
+        self._snapshot_id = None
         if self.notify is not None or DIAGNOSTICS_ENABLED:
-            GLib.timeout_add(200, self._publish_snapshot)
+            self._snapshot_id = GLib.timeout_add(200, self._publish_snapshot)
+
+    def close(self) -> None:
+        """Detach sources from the shared GLib context before another stream starts."""
+        self.notify = None
+        for attribute in ("_command_id", "_snapshot_id"):
+            source_id = getattr(self, attribute)
+            if source_id is not None:
+                self.GLib.source_remove(source_id)
+                setattr(self, attribute, None)
+        self.controller.close()
+        if self._bus_handler is not None:
+            self._bus.disconnect(self._bus_handler)
+            self._bus.remove_signal_watch()
+            self._bus_handler = None
 
     def _on_bus_message(self, _bus: Any, message: Any) -> None:
         if message.type == self.Gst.MessageType.ERROR:
@@ -480,9 +455,8 @@ class Runtime:
                 if command == "delay":
                     self.controller.set_delay_ms(value)
                     print(f"Configured delay: {self.controller.delay_ms} ms", flush=True)
-                elif command == "status":
-                    print(self.controller.status(), flush=True)
                 elif command == "quit":
+                    self._command_id = None
                     self.loop.quit()
                     return False
             except (RuntimeError, ValueError) as error:
@@ -546,120 +520,3 @@ def pump_stream(stream_io: Any, appsrc: Any, Gst: Any, stop: threading.Event, er
     except BaseException as error:
         if not stop.is_set():
             errors.put(error)
-
-
-def console_input(commands: queue.Queue[tuple[str, Any]], stop: threading.Event) -> None:
-    print("Commands: delay <0..30000>, status, quit", flush=True)
-    while not stop.is_set():
-        try:
-            line = input("> ").strip()
-        except (EOFError, OSError):
-            commands.put(("quit", None))
-            return
-        if not line:
-            continue
-        if line == "status":
-            commands.put(("status", None))
-        elif line == "quit":
-            commands.put(("quit", None))
-            return
-        elif line.startswith("delay "):
-            try:
-                delay_ms = int(line.split(maxsplit=1)[1])
-                commands.put(("delay", delay_ms))
-            except (ValueError, IndexError):
-                print("Usage: delay <0..30000>", file=sys.stderr, flush=True)
-        elif line[0] in "+-" and line[1:].isdigit():
-            print("Use 'delay <milliseconds>' to set a new delay", flush=True)
-        else:
-            print("Commands: delay <0..30000>, status, quit", flush=True)
-
-
-def run(url: str, ndi_name: str = "") -> int:
-    stream_io = None
-    runtime: Runtime | None = None
-    stop = threading.Event()
-    pump_thread: threading.Thread | None = None
-    console_thread: threading.Thread | None = None
-    try:
-        url = url.strip()
-        session = Streamlink()
-        provider, plugin, _resolved_url, ndi_name = resolve_stream(session, url, ndi_name)
-        Gst, GLib = load_gst()
-        Gst.init(None)
-        streams = plugin.streams()
-        if not streams:
-            raise ValueError(f"No live stream is available for this {provider.title()} URL.")
-        print("Available streams:")
-        print(", ".join(streams))
-        selected_name, selected_stream = select_stream(plugin, streams)
-        print(f"\nSelected: {selected_name}\nNDI name: {ndi_name}", flush=True)
-
-        pipeline, elements = build_pipeline(Gst, ndi_name)
-        runtime = Runtime(Gst, GLib, pipeline, elements)
-        stream_io = selected_stream.open()
-        result = pipeline.set_state(Gst.State.PLAYING)
-        if result == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("Could not start GStreamer pipeline")
-        pump_errors: queue.Queue[BaseException] = queue.Queue()
-        pump_thread = threading.Thread(
-            target=pump_stream,
-            args=(stream_io, elements["appsrc"], Gst, stop, pump_errors),
-            name="streamlink-pump",
-            daemon=True,
-        )
-        pump_thread.start()
-        console_thread = threading.Thread(
-            target=console_input, args=(runtime.commands, stop), name="delay-console", daemon=True
-        )
-        console_thread.start()
-        watcher_id = GLib.timeout_add(100, lambda: _check_pump_error(runtime, pump_errors))
-        try:
-            runtime.loop.run()
-        finally:
-            GLib.source_remove(watcher_id)
-        if runtime.failed:
-            raise runtime.failed
-        return 0
-    except KeyboardInterrupt:
-        print("\nStopping...", file=sys.stderr, flush=True)
-        return 0
-    except (StreamlinkError, OSError, ValueError, RuntimeError) as error:
-        print(f"Error: {error}", file=sys.stderr, flush=True)
-        return 1
-    except Exception as error:
-        print(f"Unexpected error: {error}", file=sys.stderr, flush=True)
-        return 1
-    finally:
-        stop.set()
-        if runtime is not None:
-            runtime.pipeline.set_state(runtime.Gst.State.NULL)
-        if stream_io is not None:
-            try:
-                stream_io.close()
-            except Exception:
-                pass
-        if pump_thread is not None:
-            pump_thread.join(timeout=2)
-
-
-def _check_pump_error(runtime: Runtime, errors: queue.Queue[BaseException]) -> bool:
-    try:
-        error = errors.get_nowait()
-    except queue.Empty:
-        return True
-    runtime.failed = RuntimeError(f"Streamlink input error: {error}")
-    runtime.loop.quit()
-    return False
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(prog="LiveRelay")
-    parser.add_argument("url", help="Live stream URL")
-    parser.add_argument("--ndi-name", help="NDI source name (required for YouTube)")
-    args = parser.parse_args()
-    raise SystemExit(run(args.url, args.ndi_name or ""))
-
-
-if __name__ == "__main__":
-    main()
