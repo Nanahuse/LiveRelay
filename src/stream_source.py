@@ -52,6 +52,14 @@ def resolve_stream(session: Any, url: str, ndi_name: str = "") -> tuple[str, Any
                 "Enter an NDI Source Name manually."
             )
 
-    options = {"low-latency": True} if provider == "twitch" else {}
+    options = {}
+    if provider == "twitch":
+        # Mirror Streamlink's Twitch low-latency reader settings before opening
+        # the stream, including when the plugin is used through the Python API.
+        options["low-latency"] = True
+        live_edge = max(1, min(2, session.get_option("hls-live-edge")))
+        session.set_option("hls-live-edge", live_edge)
+        session.set_option("hls-segment-stream-data", True)
+        print(f"Twitch low-latency mode enabled (HLS live edge: {live_edge})", flush=True)
     plugin = plugin_class(session, resolved_url, options=options)
     return provider, plugin, resolved_url, ndi_name
