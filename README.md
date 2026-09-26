@@ -110,8 +110,11 @@ Only qualities classified as `pixels` by the provider's Streamlink
 Minimum Resolution is editable only while Stopped or in Error. Changes apply
 on the next Start; running streams do not change quality.
 
-Twitch uses Streamlink's low-latency mode; YouTube uses Streamlink's default
-settings. Twitch broadcasters must enable low-latency streaming for their
+Twitch automatically enables Streamlink's low-latency mode, caps the HLS live
+edge at 2 segments, and streams segment data as it arrives instead of waiting
+for a full segment download. Startup logs confirm that the mode is enabled.
+These settings follow [Streamlink's Twitch low-latency mode](https://streamlink.github.io/cli/plugins/twitch.html#low-latency-streaming).
+YouTube uses Streamlink's default settings. Twitch broadcasters must enable low-latency streaming for their
 channels; regular streams may buffer with this option. The GUI starts with a
 0-second delay, supports 0–30 seconds in 0.1-second steps or larger buttons,
 and stops the stream when the window closes. Reducing delay drops the combined
