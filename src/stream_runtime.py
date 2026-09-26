@@ -16,9 +16,8 @@ INITIAL_DELAY_MS = 0
 QUEUE_MAX_TIME_NS = 35_000_000_000
 QUEUE_MAX_BYTES = 0
 QUEUE_MAX_BUFFERS = 0
-QUEUE_TOLERANCE_NS = 10_000_000
+OUTPUT_TIMING_TOLERANCE_NS = 50_000_000
 QUEUE_POLL_INTERVAL_MS = 50
-QUEUE_LOG_INTERVAL_MS = 1_000
 QUEUE_STALL_WARNING_SECONDS = 10
 CHUNK_SIZE = 64 * 1024
 APP_SOURCE_MAX_BYTES = 1024 * 1024
@@ -245,29 +244,35 @@ class Adjustment:
     new_delay_ms: int
     direction: str
     started_at: float
-    video_start_ns: int
-    audio_start_ns: int
-    video_start_bytes: int
-    audio_start_bytes: int
     stall_warning_emitted: bool = False
-    last_report_at: float = 0.0
 
 
 class DelayController:
-    def __init__(self, GLib: Any, elements: dict[str, Any], initial_delay_ms: int = INITIAL_DELAY_MS) -> None:
+    def __init__(self, GLib: Any, elements: dict[str, Any], initial_delay_ms: int = INITIAL_DELAY_MS, *, Gst: Any) -> None:
+        self.Gst = Gst
         self.GLib = GLib
         self.elements = elements
         self.delay_ms = initial_delay_ms
         self.adjustment: Adjustment | None = None
         self._poll_id: int | None = None
+        self._output_probe: tuple[Any, int] | None = None
+        self._generation = 0
         self._lock = threading.RLock()
 
     def close(self) -> None:
         with self._lock:
+            self._generation += 1
             if self._poll_id is not None:
                 self.GLib.source_remove(self._poll_id)
                 self._poll_id = None
+            self._remove_output_probe()
             self.adjustment = None
+
+    def _remove_output_probe(self) -> None:
+        if self._output_probe is not None:
+            pad, probe_id = self._output_probe
+            self._output_probe = None
+            pad.remove_probe(probe_id)
 
     @staticmethod
     def _validate(delay_ms: int) -> int:
@@ -276,89 +281,126 @@ class DelayController:
         return delay_ms
 
     def set_delay_ms(self, delay_ms: int) -> None:
-        delay_ms = self._validate(delay_ms)
         with self._lock:
-            if self.adjustment is not None:
-                raise RuntimeError("Delay adjustment already in progress")
+            self._validate(delay_ms)
             old_delay_ms = self.delay_ms
             if delay_ms == old_delay_ms:
-                print(f"Delay remains {delay_ms} ms", flush=True)
                 return
-            if delay_ms > old_delay_ms:
-                self.delay_ms = delay_ms
-                self.elements["delay_sync"].set_property("ts-offset", delay_ms * 1_000_000)
-                print(f"Delay adjustment: {old_delay_ms}ms -> {delay_ms}ms", flush=True)
-                return
+            self.close()
+            try:
+                self._apply_delay_ms(old_delay_ms, delay_ms)
+            except Exception:
+                self.close()
+                self.delay_ms = old_delay_ms
+                try:
+                    self.elements["delay_sync"].set_property("ts-offset", old_delay_ms * 1_000_000)
+                    self.elements["output_valve"].set_property("drop", False)
+                except Exception as rollback_error:
+                    raise RuntimeError(f"Delay change failed and could not restore output: {rollback_error}")
+                raise
 
-            video = self.elements["video_delay_queue"]
-            audio = self.elements["audio_delay_queue"]
-            video_level = int(video.get_property("current-level-time"))
-            audio_level = int(audio.get_property("current-level-time"))
-            video_bytes = int(video.get_property("current-level-bytes"))
-            audio_bytes = int(audio.get_property("current-level-bytes"))
-            self.adjustment = Adjustment(
-                old_delay_ms, delay_ms, "decreasing", time.monotonic(),
-                video_level, audio_level, video_bytes, audio_bytes,
-            )
-            self.delay_ms = delay_ms
-            self.elements["output_valve"].set_property("drop", True)
-            self.elements["delay_sync"].set_property("ts-offset", delay_ms * 1_000_000)
-            print(
-                f"Delay adjustment: {old_delay_ms}ms -> {delay_ms}ms; "
-                f"Video queue: {video_level / 1e6:.0f}ms -> pending; "
-                f"Audio queue: {audio_level / 1e6:.0f}ms -> pending",
-                flush=True,
-            )
-            self._poll_id = self.GLib.timeout_add(QUEUE_POLL_INTERVAL_MS, self._poll_decrease)
+    def _apply_delay_ms(self, old_delay_ms: int, delay_ms: int) -> None:
+        # Replace both the setting and completion observer on every request.
+        # Old callbacks must never reopen the valve or finish a newer adjustment.
+        generation = self._generation
+        ready = threading.Event()
+        remaining = 2
+        sync = self.elements["delay_sync"]
+        latency_query = self.Gst.Query.new_latency()
+        upstream_latency_ns = 0
+        if sync.get_static_pad("sink").peer_query(latency_query):
+            live, minimum, _maximum = latency_query.parse_latency()
+            if live:
+                upstream_latency_ns = minimum
 
-    def _poll_decrease(self) -> bool:
-        with self._lock:
-            adjustment = self.adjustment
-            if adjustment is None:
-                self._poll_id = None
-                return False
-            video = self.elements["video_delay_queue"]
-            audio = self.elements["audio_delay_queue"]
-            video_now = int(video.get_property("current-level-time"))
-            audio_now = int(audio.get_property("current-level-time"))
-            video_bytes = int(video.get_property("current-level-bytes"))
-            audio_bytes = int(audio.get_property("current-level-bytes"))
-            reduction_ns = (adjustment.old_delay_ms - adjustment.new_delay_ms) * 1_000_000
-            video_reduction = adjustment.video_start_ns - video_now
-            audio_reduction = adjustment.audio_start_ns - audio_now
-            elapsed = time.monotonic() - adjustment.started_at
-            report_progress = elapsed - adjustment.last_report_at >= QUEUE_LOG_INTERVAL_MS / 1_000
-            video_enough = max(
-                0, min(reduction_ns, adjustment.video_start_ns) - QUEUE_TOLERANCE_NS
-            )
-            audio_enough = max(
-                0, min(reduction_ns, adjustment.audio_start_ns) - QUEUE_TOLERANCE_NS
-            )
-            video_done = video_enough == 0 or video_reduction >= video_enough
-            audio_done = audio_enough == 0 or audio_reduction >= audio_enough
-            if video_done and audio_done:
-                self.elements["output_valve"].set_property("drop", False)
-                self.adjustment = None
-                self._poll_id = None
-                print("Delay adjustment complete", flush=True)
-                return False
-            if report_progress:
-                adjustment.last_report_at = elapsed
-                print(
-                    f"Delay adjustment progress: video={video_now / 1e6:.0f}ms "
-                    f"({video_bytes}B, reduced {video_reduction / 1e6:.0f}ms), "
-                    f"audio={audio_now / 1e6:.0f}ms "
-                    f"({audio_bytes}B, reduced {audio_reduction / 1e6:.0f}ms)",
-                    flush=True,
-                )
-            if elapsed >= QUEUE_STALL_WARNING_SECONDS and not adjustment.stall_warning_emitted:
-                adjustment.stall_warning_emitted = True
-                print(
-                    "Warning: Delay queues have not shrunk enough; continuing to drop NDI output",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            return True
+        def on_output(pad: Any, info: Any) -> Any:
+            nonlocal remaining
+            measured = self._output_delay_ns(pad, info, upstream_latency_ns)
+            # Queue depth includes prefetched input and is not output latency.
+            # Only buffers synchronized to the latest target prove completion.
+            if measured is not None and abs(measured - delay_ms * 1_000_000) <= OUTPUT_TIMING_TOLERANCE_NS:
+                remaining -= 1
+            else:
+                remaining = 2
+            if remaining <= 0:
+                ready.set()
+            return self.Gst.PadProbeReturn.OK
+
+        direction = "increasing" if delay_ms > old_delay_ms else "decreasing"
+        adjustment = Adjustment(old_delay_ms, delay_ms, direction, time.monotonic())
+        self.elements["delay_sync"].set_property("ts-offset", delay_ms * 1_000_000)
+        self.delay_ms = delay_ms
+        self.adjustment = adjustment
+        # Always release a previous decrease's valve when reversing direction.
+        self.elements["output_valve"].set_property("drop", direction == "decreasing")
+        pad = self.elements["delay_sync"].get_static_pad("src")
+        if pad is None:
+            raise RuntimeError("Could not monitor Delay output")
+        probe_id = pad.add_probe(
+            self.Gst.PadProbeType.BUFFER | self.Gst.PadProbeType.BUFFER_LIST, on_output,
+        )
+        if not probe_id:
+            raise RuntimeError("Could not monitor Delay output")
+        self._output_probe = (pad, probe_id)
+
+        def poll() -> bool:
+            with self._lock:
+                if generation != self._generation:
+                    return False
+                if ready.is_set():
+                    self.elements["output_valve"].set_property("drop", False)
+                    self._remove_output_probe()
+                    self.adjustment = None
+                    self._poll_id = None
+                    print(f"Delay adjustment complete: {delay_ms}ms", flush=True)
+                    return False
+                elapsed = time.monotonic() - adjustment.started_at
+                if elapsed >= QUEUE_STALL_WARNING_SECONDS and not adjustment.stall_warning_emitted:
+                    adjustment.stall_warning_emitted = True
+                    # Missing/late timestamps must not leave NDI muted forever.
+                    # Keep observing progress without claiming it is complete.
+                    self.elements["output_valve"].set_property("drop", False)
+                    print(f"Warning: Delay {delay_ms}ms timing not confirmed; output unmuted", file=sys.stderr, flush=True)
+                return True
+
+        self._poll_id = self.GLib.timeout_add(QUEUE_POLL_INTERVAL_MS, poll)
+        print(f"Delay adjustment: {old_delay_ms}ms -> {delay_ms}ms", flush=True)
+
+    def _output_delay_ns(self, pad: Any, info: Any, upstream_latency_ns: int) -> int | None:
+        if info.type & self.Gst.PadProbeType.BUFFER_LIST:
+            buffers = info.get_buffer_list()
+            buffer = buffers.get(0) if buffers is not None and buffers.length() else None
+        else:
+            buffer = info.get_buffer()
+        if buffer is None:
+            return None
+        timestamp = buffer.dts if buffer.dts != self.Gst.CLOCK_TIME_NONE else buffer.pts
+        event = pad.get_sticky_event(self.Gst.EventType.SEGMENT, 0)
+        if timestamp == self.Gst.CLOCK_TIME_NONE or event is None:
+            return None
+        segment = event.parse_segment()
+        if segment.format != self.Gst.Format.TIME:
+            return None
+        timestamp = segment.to_running_time(self.Gst.Format.TIME, timestamp)
+        now = self.elements["delay_sync"].get_current_running_time()
+        if timestamp == self.Gst.CLOCK_TIME_NONE or now == self.Gst.CLOCK_TIME_NONE:
+            return None
+        return now - timestamp - upstream_latency_ns
+
+
+@dataclass(frozen=True)
+class SetDelayRequest:
+    request_id: int
+    target_delay_ms: int
+
+
+@dataclass(frozen=True)
+class RuntimeEvent:
+    stream_id: str
+    session_id: int
+    event_type: str
+    payload: Any = None
+    request_id: int | None = None
 
 
 class Runtime:
@@ -370,15 +412,20 @@ class Runtime:
         elements: dict[str, Any],
         initial_delay_ms: int = INITIAL_DELAY_MS,
         notify: Any = None,
+        stream_id: str = "primary",
+        session_id: int = 0,
     ) -> None:
+        self.stream_id = stream_id
+        self.session_id = session_id
         self.Gst = Gst
         self.GLib = GLib
         self.pipeline = pipeline
         self.elements = elements
         self.loop = GLib.MainLoop()
         self.commands: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._pending_delay_request: SetDelayRequest | None = None
         self.failed: BaseException | None = None
-        self.controller = DelayController(GLib, elements, initial_delay_ms)
+        self.controller = DelayController(GLib, elements, initial_delay_ms, Gst=Gst)
         self.notify = notify
         self._diagnostic_started_at = time.monotonic()
         self._last_diagnostic_at = 0.0
@@ -390,9 +437,14 @@ class Runtime:
         if self.notify is not None or DIAGNOSTICS_ENABLED:
             self._snapshot_id = GLib.timeout_add(200, self._publish_snapshot)
 
+    def emit(self, event_type: str, payload: Any = None, request_id: int | None = None) -> None:
+        if self.notify is not None:
+            self.notify(RuntimeEvent(self.stream_id, self.session_id, event_type, payload, request_id))
+
     def close(self) -> None:
         """Detach sources from the shared GLib context before another stream starts."""
         self.notify = None
+        self._pending_delay_request = None
         for attribute in ("_command_id", "_snapshot_id"):
             source_id = getattr(self, attribute)
             if source_id is not None:
@@ -409,20 +461,19 @@ class Runtime:
             error, debug = message.parse_error()
             self.failed = RuntimeError(f"GStreamer error: {error}; {debug or ''}")
             if self.notify is not None:
-                self.notify("error", str(error))
+                self.emit("error", str(error))
             self.loop.quit()
         elif message.type == self.Gst.MessageType.EOS:
             self.loop.quit()
         elif message.type == self.Gst.MessageType.STATE_CHANGED and message.src == self.pipeline:
             _old, new, _pending = message.parse_state_changed()
             if new == self.Gst.State.PLAYING and self.notify is not None:
-                self.notify("running", None)
+                self.emit("running")
 
     def _publish_snapshot(self) -> bool:
         try:
             now = time.monotonic()
             snapshot = {
-                "delay_ms": self.controller.delay_ms,
                 "adjusting_delay": self.controller.adjustment is not None,
                 "appsrc_buffer_bytes": int(self.elements["appsrc"].get_property("current-level-bytes")),
                 "video_buffer_ms": int(self.elements["video_delay_queue"].get_property("current-level-time")) // 1_000_000,
@@ -435,12 +486,12 @@ class Runtime:
                     f"appsrc_bytes={snapshot['appsrc_buffer_bytes']} "
                     f"video_queue_ms={snapshot['video_buffer_ms']} "
                     f"audio_queue_ms={snapshot['audio_buffer_ms']} "
-                    f"delay_ms={snapshot['delay_ms']} "
+                    f"delay_ms={self.controller.delay_ms} "
                     f"adjusting={snapshot['adjusting_delay']}",
                     flush=True,
                 )
             if self.notify is not None:
-                self.notify("runtime_snapshot", snapshot)
+                self.emit("runtime_snapshot", snapshot)
         except Exception as error:
             print(f"Could not read GStreamer status: {error}", file=sys.stderr, flush=True)
         return True
@@ -450,17 +501,36 @@ class Runtime:
             try:
                 command, value = self.commands.get_nowait()
             except queue.Empty:
-                return True
-            try:
-                if command == "delay":
-                    self.controller.set_delay_ms(value)
-                    print(f"Configured delay: {self.controller.delay_ms} ms", flush=True)
-                elif command == "quit":
-                    self._command_id = None
-                    self.loop.quit()
-                    return False
-            except (RuntimeError, ValueError) as error:
-                print(f"Error: {error}", file=sys.stderr, flush=True)
+                break
+            if command == "set_delay":
+                previous = self._pending_delay_request
+                self._pending_delay_request = value
+                if previous is not None:
+                    self.emit("delay_change_failed", {
+                        "error": "Superseded by a newer Delay request",
+                    }, previous.request_id)
+            elif command == "quit":
+                self._pending_delay_request = None
+                self._command_id = None
+                self.loop.quit()
+                return False
+
+        # Coalesce requests received within this tick, then retarget immediately,
+        # even when the previous adjustment is still in progress.
+        if self._pending_delay_request is None:
+            return True
+        request = self._pending_delay_request
+        self._pending_delay_request = None
+        try:
+            self.controller.set_delay_ms(request.target_delay_ms)
+            self.emit("delay_changed", {
+                "delay_ms": self.controller.delay_ms,
+                "adjusting_delay": self.controller.adjustment is not None,
+            }, request.request_id)
+        except Exception as error:
+            self.emit("delay_change_failed", {"error": str(error)}, request.request_id)
+            print(f"Error: {error}", file=sys.stderr, flush=True)
+        return True
 
 
 def pump_stream(stream_io: Any, appsrc: Any, Gst: Any, stop: threading.Event, errors: queue.Queue[BaseException]) -> None:

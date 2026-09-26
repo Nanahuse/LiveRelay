@@ -5,6 +5,19 @@ from controller import SingleStreamController
 from stream_runtime import Runtime
 
 
+def output_sample(runtime, delay_ms=None):
+    sync = runtime.elements['delay_sync']
+    delay_ms = runtime.controller.delay_ms if delay_ms is None else delay_ms
+    sync.get_current_running_time.return_value = 1_000_000_000 + delay_ms * 1_000_000
+    pad = sync.get_static_pad.return_value
+    segment = pad.get_sticky_event.return_value.parse_segment.return_value
+    segment.format = runtime.Gst.Format.TIME
+    segment.to_running_time.side_effect = lambda _format, timestamp: timestamp
+    info = Mock(type=runtime.Gst.PadProbeType.BUFFER)
+    info.get_buffer.return_value = Mock(dts=runtime.Gst.CLOCK_TIME_NONE, pts=1_000_000_000)
+    return pad, info
+
+
 class FakeGLib:
     def __init__(self):
         self.callbacks = {}
@@ -34,17 +47,22 @@ class RuntimeLifecycleTests(unittest.TestCase):
         }
         for element in elements.values():
             element.get_property.return_value = 0
-        return Runtime(Mock(), glib, Mock(), elements, delay, notify)
+        gst = Mock()
+        gst.PadProbeType.BUFFER = 1
+        gst.PadProbeType.BUFFER_LIST = 2
+        gst.CLOCK_TIME_NONE = 2**64 - 1
+        elements['delay_sync'].get_static_pad.return_value.peer_query.return_value = False
+        return Runtime(gst, glib, Mock(), elements, delay, notify)
 
     def test_restart_does_not_publish_previous_delay(self):
         glib = FakeGLib()
         controller = SingleStreamController()
         published = []
 
-        def notify(event, value):
-            controller._on_runtime_event(event, value)
-            if event == "runtime_snapshot":
-                published.append(controller.snapshot().target_delay_ms)
+        def notify(event):
+            controller._on_runtime_event(event)
+            if event.event_type == "runtime_snapshot":
+                published.append(controller.snapshot().display_delay_ms)
 
         old = self.make_runtime(glib, notify)
         old.commands.put(("quit", None))
@@ -78,6 +96,9 @@ class RuntimeLifecycleTests(unittest.TestCase):
         glib = FakeGLib()
         runtime = self.make_runtime(glib, Mock(), delay=5000)
         runtime.controller.set_delay_ms(1000)
+        callback = runtime.elements["delay_sync"].get_static_pad.return_value.add_probe.call_args.args[1]
+        callback(*output_sample(runtime))
+        callback(*output_sample(runtime))
         glib.tick()
         self.assertEqual(len(glib.callbacks), 2)
         runtime.close()
