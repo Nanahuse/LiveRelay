@@ -4,13 +4,13 @@ Relay Twitch and YouTube live streams to an NDI source on Windows.
 
 LiveRelay supports Twitch Live and YouTube Live URLs. YouTube VODs and regular
 videos are not supported. Twitch can use the account name as the NDI source
-name when `--ndi-name` is omitted; YouTube requires an explicit NDI source name.
+name when NDI Source Name is blank; YouTube requires an explicit NDI source name.
 
 ## Requirements
 
 - Python 3.14 or newer, managed with `uv`
 - GStreamer 1.28.6 MSVC x86_64 Full Runtime source in `runtime-source/gstreamer-full`; generate the private runtime under `runtime/gstreamer`
-- Matching `gstreamer-python` bindings (declared in the script metadata)
+- Matching `gstreamer-python` bindings (declared in the project dependencies)
 - GStreamer elements: `parsebin`, `d3d11h264dec`, `d3d11download`, `mfaacdec`, `ndisinkcombiner`, and `ndisink`
 - NDI Runtime installed locally and selected through `NDI_RUNTIME_DIR_V6`
 
@@ -97,14 +97,19 @@ The windowed executable writes diagnostics to
 `%LOCALAPPDATA%\LiveRelay\logs\liverelay.log` and stores its private
 GStreamer registry under `%LOCALAPPDATA%\LiveRelay\cache`.
 
-The previous command-line interface remains available:
+The GUI's Minimum Resolution selector offers 144p, 240p, 360p, 480p, 720p,
+and 1080p. It defaults to 480p each time the application opens and is not saved.
+Both providers use Streamlink's pixel weights to select the lowest quality at
+or above the selected minimum, including qualities such as 720p60. An exact
+match is not required: a 720p minimum selects 1080p if it is the lowest available
+candidate. If no qualifying pixel stream exists, startup fails with an error
+that includes the selected minimum.
+Only qualities classified as `pixels` by the provider's Streamlink
+`stream_weight()` are eligible; other groups are excluded.
 
-```powershell
-liverelay-cli https://www.twitch.tv/example
-liverelay-cli https://www.youtube.com/live/XXXXXXXXXXX --ndi-name "Runner A"
-```
+Minimum Resolution is editable only while Stopped or in Error. Changes apply
+on the next Start; running streams do not change quality.
 
-The GUI and CLI select the lowest pixel-weight quality at 480p or higher.
 Twitch uses Streamlink's low-latency mode; YouTube uses Streamlink's default
 settings. Twitch broadcasters must enable low-latency streaming for their
 channels; regular streams may buffer with this option. The GUI starts with a

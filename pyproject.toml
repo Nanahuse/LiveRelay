@@ -17,7 +17,6 @@ dependencies = [
 
 [project.scripts]
 liverelay = "ui:main"
-liverelay-cli = "main:main"
 
 [dependency-groups]
 build = [
@@ -26,4 +25,4 @@ build = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["controller", "main", "stream_source", "stream_url", "ui"]
+py-modules = ["controller", "stream_runtime", "stream_source", "stream_url", "ui"]
