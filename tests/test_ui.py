@@ -3,6 +3,8 @@ import unittest
 from unittest.mock import patch
 
 from ui import RelayWindow
+from stream_runtime import RuntimeEvent
+from unittest.mock import Mock
 
 
 class MinimumResolutionUiTests(unittest.TestCase):
@@ -46,3 +48,50 @@ class MinimumResolutionUiTests(unittest.TestCase):
         with patch.object(self.root, "destroy"):
             self.window.on_close()
         self.assertEqual(len(self.root.tk.call("after", "info")), 0)
+
+    def test_pending_delay_stays_visible_and_failure_is_shown(self) -> None:
+        controller = self.window.controller
+        controller.change_delay_ms(5000)
+        controller._state = "running"
+        controller._runtime = Mock()
+        self.window.on_delay(1000)
+        self.assertEqual(self.window.delay_var.get(), "6.0 s")
+        for button, amount in self.window._delay_buttons:
+            expected = 'normal' if 0 <= controller.snapshot().display_delay_ms + amount <= 30000 else 'disabled'
+            self.assertEqual(str(button['state']), expected)
+        for _ in range(3):
+            controller._on_runtime_event(RuntimeEvent("primary", 0, "runtime_snapshot", {
+                "adjusting_delay": False, "video_buffer_ms": 0, "audio_buffer_ms": 0,
+            }))
+            self.window.refresh_ui()
+            self.assertEqual(self.window.delay_var.get(), "6.0 s")
+        controller._on_runtime_event(RuntimeEvent(
+            "primary", 0, "delay_change_failed", {"error": "Delay rejected"}, 1,
+        ))
+        self.window.refresh_ui()
+        self.assertEqual(self.window.delay_var.get(), "5.0 s")
+        self.assertEqual(self.window.error_var.get(), "Delay rejected")
+        self.assertEqual(len(self.root.tk.call("after", "info")), 1)
+
+    def test_delay_controls_accept_input_during_increase(self) -> None:
+        controller = self.window.controller
+        controller._state = 'running'
+        controller._runtime = Mock()
+        self.window.on_delay(1000)
+        controller._on_runtime_event(RuntimeEvent('primary', 0, 'delay_changed', {
+            'delay_ms': 1000, 'adjusting_delay': True,
+        }, 1))
+        self.window.refresh_ui()
+        for button, amount in self.window._delay_buttons:
+            expected = 'normal' if 0 <= controller.snapshot().display_delay_ms + amount <= 30000 else 'disabled'
+            self.assertEqual(str(button['state']), expected)
+        self.window.on_delay(-100)
+        self.assertEqual(self.window.delay_var.get(), '0.9 s')
+        self.assertEqual(controller.snapshot().requested_delay_ms, 900)
+        controller._on_runtime_event(RuntimeEvent('primary', 0, 'runtime_snapshot', {
+            'adjusting_delay': False, 'video_buffer_ms': 1000, 'audio_buffer_ms': 1000,
+        }))
+        self.window.refresh_ui()
+        for button, amount in self.window._delay_buttons:
+            if 0 <= 900 + amount <= 30000:
+                self.assertEqual(str(button['state']), 'normal')

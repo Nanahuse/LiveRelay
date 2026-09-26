@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import sys
 import threading
@@ -10,9 +11,12 @@ from streamlink import Streamlink
 from streamlink.exceptions import StreamlinkError
 
 from stream_runtime import (
+    DIAGNOSTICS_ENABLED,
     INITIAL_DELAY_MS,
     MAX_DELAY_MS,
     Runtime,
+    RuntimeEvent,
+    SetDelayRequest,
     build_pipeline,
     load_gst,
     pump_stream,
@@ -30,18 +34,24 @@ class StreamSnapshot:
     height: int | None
     fps: float | None
     audio_rate: int | None
-    delay_ms: int
-    target_delay_ms: int
+    confirmed_delay_ms: int
+    requested_delay_ms: int | None
+    display_delay_ms: int
     adjusting_delay: bool
     video_buffer_ms: int
     audio_buffer_ms: int
     error: str | None
 
 
-class SingleStreamController:
+class StreamController:
     """Owns one Streamlink session and its GStreamer pipeline."""
 
-    def __init__(self) -> None:
+    def __init__(self, stream_id: str = "primary") -> None:
+        self.stream_id = stream_id
+        self.session_id = 0
+        self.latest_delay_request_id = 0
+        self._confirmed_request_id = 0
+        self._completed_delay_request_id = 0
         self._lock = threading.RLock()
         self._state = "stopped"
         self._url = ""
@@ -52,9 +62,8 @@ class SingleStreamController:
         self._height: int | None = None
         self._fps: float | None = None
         self._audio_rate: int | None = None
-        self._delay_ms = INITIAL_DELAY_MS
-        self._target_delay_ms = INITIAL_DELAY_MS
-        self._delay_pending = False
+        self._confirmed_delay_ms = INITIAL_DELAY_MS
+        self._requested_delay_ms: int | None = None
         self._adjusting = False
         self._video_buffer_ms = 0
         self._audio_buffer_ms = 0
@@ -74,13 +83,18 @@ class SingleStreamController:
                 height=self._height,
                 fps=self._fps,
                 audio_rate=self._audio_rate,
-                delay_ms=self._delay_ms,
-                target_delay_ms=self._target_delay_ms,
+                confirmed_delay_ms=self._confirmed_delay_ms,
+                requested_delay_ms=self._requested_delay_ms,
+                display_delay_ms=self._display_delay_ms,
                 adjusting_delay=self._adjusting,
                 video_buffer_ms=self._video_buffer_ms,
                 audio_buffer_ms=self._audio_buffer_ms,
                 error=self._error,
             )
+
+    @property
+    def _display_delay_ms(self) -> int:
+        return self._requested_delay_ms if self._requested_delay_ms is not None else self._confirmed_delay_ms
 
     @property
     def shutdown_complete(self) -> bool:
@@ -112,10 +126,11 @@ class SingleStreamController:
             self._audio_buffer_ms = 0
             self._error = None
             self._adjusting = False
-            self._delay_pending = False
+            self._requested_delay_ms = None
+            self.session_id += 1
             self._state = "starting"
             self._stop_event = threading.Event()
-            worker = threading.Thread(target=self._run_stream, name="single-stream-controller", daemon=True)
+            worker = threading.Thread(target=self._run_stream, args=(self.session_id,), name="single-stream-controller", daemon=True)
             self._worker = worker
             worker.start()
 
@@ -138,25 +153,31 @@ class SingleStreamController:
         with self._lock:
             if self._state in ("starting", "stopping"):
                 raise RuntimeError("Delay controls are unavailable while the stream is starting or stopping.")
-            if self._adjusting:
-                raise RuntimeError("Delay adjustment already in progress.")
-            target = self._target_delay_ms + amount_ms
+            target = self._display_delay_ms + amount_ms
             if not 0 <= target <= MAX_DELAY_MS:
                 raise ValueError(f"Delay must stay between 0.0 and {MAX_DELAY_MS / 1000:.1f} seconds.")
             if self._state in ("stopped", "error"):
-                self._delay_ms = target
-                self._target_delay_ms = target
-                self._delay_pending = False
+                self._confirmed_delay_ms = target
+                self._requested_delay_ms = None
                 return
             runtime = self._runtime
             if runtime is None:
                 raise RuntimeError("Stream controls are not ready yet.")
-            self._target_delay_ms = target
-            self._delay_pending = True
-            if amount_ms < 0:
-                self._adjusting = True
-                self._state = "adjusting"
-            runtime.commands.put(("delay", target))
+            self.latest_delay_request_id += 1
+            self._requested_delay_ms = target
+            self._error = None
+            self._log_delay("set_delay", self.latest_delay_request_id)
+            runtime.commands.put(("set_delay", SetDelayRequest(self.latest_delay_request_id, target)))
+
+    def _log_delay(self, event_type: str, request_id: int | None, *, stale: bool = False) -> None:
+        message = (
+            f"event_type={event_type} stream_id={self.stream_id} session_id={self.session_id} "
+            f"request_id={request_id} requested_delay_ms={self._requested_delay_ms} "
+            f"confirmed_delay_ms={self._confirmed_delay_ms} stale={stale}"
+        )
+        logging.getLogger(__name__).debug(message)
+        if DIAGNOSTICS_ENABLED:
+            print(f"DIAG {message}", flush=True)
 
     def _on_media_info(self, info: dict[str, Any]) -> None:
         with self._lock:
@@ -167,28 +188,50 @@ class SingleStreamController:
             elif info["media"] == "audio":
                 self._audio_rate = info.get("audio_rate")
 
-    def _on_runtime_event(self, event: str, value: Any) -> None:
+    def _on_runtime_event(self, message: RuntimeEvent) -> None:
         with self._lock:
-            if event == "running":
+            if message.stream_id != self.stream_id or message.session_id != self.session_id:
+                logging.getLogger(__name__).debug("Ignoring stale runtime event: %s", message)
+                self._log_delay(message.event_type, message.request_id, stale=True)
+                if DIAGNOSTICS_ENABLED:
+                    print(f"DIAG ignored stream_id={message.stream_id} session_id={message.session_id}", flush=True)
+                return
+            event, value = message.event_type, message.payload
+            if event in ("delay_changed", "delay_change_failed"):
+                request_id = message.request_id
+                if (request_id is None or request_id <= max(self._confirmed_request_id, self._completed_delay_request_id)
+                        or request_id > self.latest_delay_request_id
+                        or self._requested_delay_ms is None):
+                    self._log_delay(event, request_id, stale=True)
+                    return
+                # Keep an accepted intermediate value as fallback without changing the display.
+                if event == "delay_changed":
+                    self._confirmed_delay_ms = int(value["delay_ms"])
+                    self._confirmed_request_id = request_id
+                    if "adjusting_delay" in value:
+                        self._adjusting = bool(value["adjusting_delay"])
+                        if self._state not in ("stopping", "error"):
+                            self._state = "adjusting" if self._adjusting else "running"
+                if request_id == self.latest_delay_request_id:
+                    self._completed_delay_request_id = request_id
+                    self._requested_delay_ms = None
+                    if event == "delay_change_failed":
+                        self._error = self._short_error(value["error"])
+                self._log_delay(event, request_id, stale=request_id != self.latest_delay_request_id)
+            elif event == "media_info":
+                self._on_media_info(value)
+            elif event == "running":
                 if self._state == "starting":
                     self._state = "running"
             elif event == "error":
                 self._error = self._short_error(value)
-                self._delay_pending = False
+                self._requested_delay_ms = None
                 self._state = "error"
             elif event == "runtime_snapshot":
-                self._delay_ms = int(value["delay_ms"])
-                # Keep the requested UI value until the runtime acknowledges it.
-                # This also covers increases, whose buffer adjustment is immediate
-                # and therefore does not set _adjusting.
-                if self._delay_pending and self._target_delay_ms == self._delay_ms:
-                    self._delay_pending = False
-                elif not self._delay_pending:
-                    self._target_delay_ms = self._delay_ms
                 self._video_buffer_ms = int(value["video_buffer_ms"])
                 self._audio_buffer_ms = int(value["audio_buffer_ms"])
                 self._adjusting = bool(value["adjusting_delay"])
-                if self._state not in ("stopping", "error"):
+                if self._state not in ("stopped", "stopping", "error"):
                     self._state = "adjusting" if self._adjusting else "running"
 
     @staticmethod
@@ -196,7 +239,7 @@ class SingleStreamController:
         message = str(error).strip().splitlines()[0] if error else "Stream failed."
         return message[:180]
 
-    def _run_stream(self) -> None:
+    def _run_stream(self, session_id: int) -> None:
         stream_io = None
         runtime: Runtime | None = None
         pump_thread: threading.Thread | None = None
@@ -216,18 +259,20 @@ class SingleStreamController:
             selected_name, selected_stream = select_stream(plugin, streams, self._minimum_resolution)
             with self._lock:
                 self._quality = selected_name
-                initial_delay_ms = self._target_delay_ms
+                initial_delay_ms = self._confirmed_delay_ms
             print(f"Selected {provider.title()} quality: {selected_name}", flush=True)
             if self._stop_event.is_set():
                 return
 
             pipeline, elements = build_pipeline(
-                Gst, self._ndi_name, initial_delay_ms, self._on_media_info
+                Gst, self._ndi_name, initial_delay_ms,
+                lambda info: self._on_runtime_event(RuntimeEvent(self.stream_id, session_id, "media_info", info))
             )
             runtime = Runtime(
                 Gst, GLib, pipeline, elements,
                 initial_delay_ms=initial_delay_ms,
                 notify=self._on_runtime_event,
+                stream_id=self.stream_id, session_id=session_id,
             )
             with self._lock:
                 self._runtime = runtime
@@ -280,7 +325,7 @@ class SingleStreamController:
             with self._lock:
                 self._runtime = None
                 self._adjusting = False
-                self._delay_pending = False
+                self._requested_delay_ms = None
                 if self._state != "error":
                     self._state = "stopped"
 
@@ -290,6 +335,10 @@ class SingleStreamController:
         except queue.Empty:
             return True
         runtime.failed = RuntimeError(f"Streamlink input error: {error}")
-        self._on_runtime_event("error", str(runtime.failed))
+        runtime.emit("error", str(runtime.failed))
         runtime.loop.quit()
         return False
+
+
+# Compatibility for existing single-stream callers.
+SingleStreamController = StreamController

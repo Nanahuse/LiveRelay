@@ -3,7 +3,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
-from controller import SingleStreamController
+from controller import StreamController
 
 
 DELAY_STEPS_MS = (5000, 1000, 500, 100)
@@ -13,7 +13,7 @@ MINIMUM_RESOLUTIONS = ("144p", "240p", "360p", "480p", "720p", "1080p")
 class RelayWindow:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.controller = SingleStreamController()
+        self.controller = StreamController()
         self._closing = False
         self._refresh_id: str | None = None
         self._local_error: str | None = None
@@ -189,9 +189,10 @@ class RelayWindow:
             self.video_var.set("-")
         self.audio_var.set(f"{snapshot.audio_rate / 1000:g} kHz" if snapshot.audio_rate else "-")
         self.ndi_info_var.set(snapshot.ndi_name if active else "-")
-        self.delay_var.set(f"{snapshot.target_delay_ms / 1000:.1f} s")
+        self.delay_var.set(f"{snapshot.display_delay_ms / 1000:.1f} s")
         adjusting = snapshot.adjusting_delay or state == "adjusting"
-        self.adjusting_var.set("Adjusting..." if adjusting else "")
+        pending = snapshot.requested_delay_ms is not None
+        self.adjusting_var.set("Adjusting..." if adjusting or pending else "")
 
         if active and state not in ("starting", "stopping"):
             self.video_buffer_var.set(f"{snapshot.video_buffer_ms / 1000:.2f} s")
@@ -201,9 +202,9 @@ class RelayWindow:
             self.audio_buffer_var.set("-")
         self.error_var.set(self._local_error or snapshot.error or "")
 
-        controls_ready = state in ("stopped", "error", "running") and not adjusting
+        controls_ready = state in ("stopped", "error", "running", "adjusting")
         for button, amount_ms in self._delay_buttons:
-            allowed = controls_ready and 0 <= snapshot.target_delay_ms + amount_ms <= 30_000
+            allowed = controls_ready and 0 <= snapshot.display_delay_ms + amount_ms <= 30_000
             button.config(state="normal" if allowed else "disabled")
 
         self._refresh_id = self.root.after(200, self.refresh_ui)
